@@ -1,4 +1,4 @@
-"""MiddleLayer: MLX-native OpenAI-compatible gateway.
+"""Local Lattice (MiddleLayer): MLX-native OpenAI-compatible gateway.
 
 This package is the future home of the gateway's importable Python API.
 During the OSS-readiness migration the canonical implementation still
@@ -10,8 +10,9 @@ Subsequent passes will move that code under
 P3-01). Until then this package exposes:
 
 - :func:`middle_layer.cli.main` — the console-script entry point
-  ``middle-layer-mlx``. It forwards to the legacy module's ``main()``
-  unchanged so existing behaviour is preserved bit-for-bit.
+  ``local-lattice-mlx`` (alias ``middle-layer-mlx``). It forwards to the
+  legacy module's ``main()`` unchanged so existing behaviour is preserved
+  bit-for-bit.
 
 The package contains no other public API in this release. Do not import
 private names; they will be reorganised without notice before 1.0.
