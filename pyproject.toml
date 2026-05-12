@@ -6,14 +6,14 @@ build-backend = "hatchling.build"
 # Project metadata
 # ---------------------------------------------------------------------------
 [project]
-name = "middle-layer"
-version = "0.1.0"
-description = "MLX-native OpenAI-compatible gateway with capability routing, admission queue, and a hybrid local+cloud swarm."
+name = "local-lattice"
+version = "0.2.0"
+description = "Local Lattice — MLX-native OpenAI-compatible gateway with capability routing, admission queue, and a hybrid local+cloud swarm."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
-    { name = "The MiddleLayer Authors" },
+    { name = "The Local Lattice Authors" },
 ]
 keywords = [
     "mlx",
@@ -51,10 +51,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/middle-layer/middle-layer"
-Repository = "https://github.com/middle-layer/middle-layer"
-Issues = "https://github.com/middle-layer/middle-layer/issues"
-Changelog = "https://github.com/middle-layer/middle-layer/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/chrisswimlee/local-lattice"
+Repository = "https://github.com/chrisswimlee/local-lattice"
+Issues = "https://github.com/chrisswimlee/local-lattice/issues"
+Changelog = "https://github.com/chrisswimlee/local-lattice/blob/main/CHANGELOG.md"
 
 # ---------------------------------------------------------------------------
 # Optional extras — pick what you actually need.
@@ -80,7 +80,7 @@ anthropic = [
 ]
 
 # In-process observability dashboard (no extra deps today; included for
-# completeness so docs can recommend `pip install middle-layer[dashboard]`).
+# completeness so docs can recommend `pip install local-lattice[dashboard]`).
 dashboard = []
 
 # Development and contributor tooling.
@@ -98,13 +98,17 @@ dev = [
 # Everything that can run cross-platform. Notably excludes `mlx` because
 # `mlx-lm` requires Apple Silicon and would fail to install elsewhere.
 all = [
-    "middle-layer[lmstudio,anthropic,dashboard,dev]",
+    "local-lattice[lmstudio,anthropic,dashboard,dev]",
 ]
 
 # ---------------------------------------------------------------------------
 # Console scripts
 # ---------------------------------------------------------------------------
 [project.scripts]
+# Canonical names (match PyPI distribution `local-lattice`).
+local-lattice-mlx = "middle_layer.cli:main_mlx"
+local-lattice-lmstudio = "middle_layer.cli:main_lmstudio"
+# Back-compat shims (same entry points; remove after one minor per AGENTS.md).
 middle-layer-mlx = "middle_layer.cli:main_mlx"
 middle-layer-lmstudio = "middle_layer.cli:main_lmstudio"
 
@@ -117,8 +121,8 @@ path = "middle_layer/__init__.py"
 [tool.hatch.build.targets.wheel]
 # The new package is the primary build target. The legacy top-level
 # modules and their assets are force-included next to the package so
-# `pip install middle-layer[mlx]` produces a working install that
-# `middle-layer-mlx serve --help` can dispatch into (see
+# `pip install local-lattice[mlx]` produces a working install that
+# `local-lattice-mlx serve --help` (or `middle-layer-mlx`) can dispatch into (see
 # `middle_layer.cli._legacy_main`). Pass 3 will absorb these files into
 # the package itself and drop the force-include block.
 packages = ["middle_layer"]

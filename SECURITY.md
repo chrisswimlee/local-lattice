@@ -4,8 +4,9 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | Yes                |
-| < 0.1   | No (pre-OSS tags)  |
+| 0.2.x   | Yes                |
+| 0.1.x   | Yes (best-effort; upgrade to 0.2.x) |
+| Pre-0.1 | No (pre-OSS tags)  |
 
 Security fixes are backported to the latest minor on the current major line when
 practical. After 1.0.0, the previous minor receives critical fixes for 90 days.
@@ -14,11 +15,11 @@ practical. After 1.0.0, the previous minor receives critical fixes for 90 days.
 
 **Please do not file security-sensitive issues as public GitHub issues.**
 
-Send reports to: **security@middle-layer.invalid**
+**Preferred:** use [GitHub private vulnerability reporting](https://github.com/chrisswimlee/local-lattice/security/advisories/new) for this repository (maintainers only).
 
-Replace that address with a working inbox before the repository is made public
-or advertised widely. Until then, use a private channel you already trust with
-the maintainers (for example a direct message to the repo owner).
+If that workflow is unavailable to you, contact the repository owner via their
+[GitHub profile](https://github.com/chrisswimlee) using any contact method they
+publish there.
 
 Include:
 
@@ -33,12 +34,12 @@ coordination.
 
 ## Scope
 
-In scope: the MiddleLayer gateway process, its default configuration, bundled
+In scope: the Local Lattice / MiddleLayer gateway process, its default configuration, bundled
 dashboard static assets, and documented deployment patterns (Flask dev server,
 future Docker image).
 
 Out of scope: vulnerabilities in upstream runtimes (`mlx-lm`, LM Studio,
-Anthropic API, Hugging Face Hub) unless MiddleLayer passes untrusted client
+Anthropic API, Hugging Face Hub) unless the gateway passes untrusted client
 input to them in an unsafe way.
 
 ## Hardening roadmap
