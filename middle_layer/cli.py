@@ -1,0 +1,96 @@
+"""Console-script entry point for ``middle-layer-mlx``.
+
+Pass 1 transitional shim. The real CLI definition still lives in
+``middle_layerMLX._build_cli`` at the repository root; this module
+forwards into it without modification, so
+
+::
+
+    middle-layer-mlx serve --help
+
+prints exactly the same help as
+
+::
+
+    python middle_layerMLX.py serve --help
+
+once Pass 3 extracts the canonical implementation into this package,
+this module will own the argparse definition outright and the legacy
+top-level scripts will be replaced by one-line shims.
+
+Two sub-entry-points are also provided so callers can be explicit about
+which backend they want:
+
+- ``main`` — auto-pick (currently always the MLX backend).
+- ``main_mlx`` — MLX backend (Apple Silicon, ``mlx_lm``).
+- ``main_lmstudio`` — legacy LM Studio proxy.
+
+All three call the legacy ``main()`` of the corresponding module and
+return whatever it returns (typically ``None``; SystemExit propagates).
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from typing import Callable
+
+
+def _ensure_legacy_on_path() -> None:
+    """Make the legacy top-level modules importable.
+
+    When this package is installed with ``pip install -e .`` from the
+    repository root, the repo root is added to ``sys.path`` by the
+    editable install and the legacy modules are importable
+    automatically. When installed from a wheel, Hatch's
+    ``force-include`` in ``pyproject.toml`` copies the legacy files
+    next to this package, so the resolution still works.
+
+    For defence-in-depth, we also add the parent of this package's
+    directory to ``sys.path[0]`` if the legacy file is co-located
+    there. This is a no-op in correctly-installed environments.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.abspath(os.path.join(here, os.pardir))
+    candidate = os.path.join(parent, "middle_layerMLX.py")
+    if os.path.isfile(candidate) and parent not in sys.path:
+        sys.path.insert(0, parent)
+
+
+def _legacy_main(module_name: str) -> Callable[[], None]:
+    _ensure_legacy_on_path()
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:  # pragma: no cover - import-time wiring
+        raise SystemExit(
+            f"middle-layer-mlx: could not import legacy module {module_name!r}: "
+            f"{exc}. Reinstall the package or run `python {module_name}.py serve` "
+            "directly from a source checkout."
+        ) from exc
+    fn = getattr(module, "main", None)
+    if not callable(fn):
+        raise SystemExit(
+            f"middle-layer-mlx: legacy module {module_name!r} has no callable "
+            "main(); reinstall the package."
+        )
+    return fn
+
+
+def main_mlx() -> None:
+    """Entry point: ``middle-layer-mlx`` — MLX backend."""
+    _legacy_main("middle_layerMLX")()
+
+
+def main_lmstudio() -> None:
+    """Entry point: ``middle-layer-lmstudio`` — legacy LM Studio proxy."""
+    _legacy_main("middle_layer")()
+
+
+def main() -> None:
+    """Default entry point; identical to :func:`main_mlx` in this release."""
+    main_mlx()
+
+
+if __name__ == "__main__":  # pragma: no cover - manual invocation only
+    main()

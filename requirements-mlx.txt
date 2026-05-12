@@ -1,7 +1,11 @@
-flask>=3.0
-mlx-lm>=0.19
-huggingface_hub>=0.20
-requests>=2.28
-flask-cors>=5.0
-gunicorn>=22.0
-litellm
+# DEPRECATED — use `pip install middle-layer[mlx]` instead.
+#
+# This file is a thin compatibility shim kept for one minor version so
+# existing tooling that runs `pip install -r requirements-mlx.txt`
+# continues to work. It installs the project in editable mode with the
+# `[mlx]` extra, which is the new source of truth for the MLX runtime
+# dependency set. See `pyproject.toml` for the full list.
+#
+# Will be removed in 0.2.0.
+
+--editable .[mlx]
