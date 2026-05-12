@@ -119,5 +119,5 @@ captured by the Pass 0 baseline (`docs/_internal/baseline/` on
   front of the gateway. See [SECURITY.md](SECURITY.md).
 
 [Unreleased]: https://github.com/chrisswimlee/local-lattice/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/chrisswimlee/local-lattice/releases
+[0.2.0]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.2.0
 [0.1.0]: https://github.com/chrisswimlee/local-lattice/releases
