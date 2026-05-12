@@ -68,6 +68,7 @@ import sys
 import json
 import time
 import re
+import warnings
 import uuid
 import logging
 import threading
@@ -216,16 +217,39 @@ MLX_QUEUE_DEFAULT_PRIORITY = int(os.environ.get("MLX_QUEUE_DEFAULT_PRIORITY", "0
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "").strip()
 
 # Resolver placeholders / fallback policy
-PLACEHOLDER_MODELS = {
+_CORE_PLACEHOLDER_MODELS = frozenset({
     "", "auto", "default",
-    # OpenClaw provider model ids (any of these means "you pick").
+    "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-turbo", "gpt-4.1",
+    "claude-3-5-sonnet", "claude-3-opus",
+})
+_OPENCLAW_DEFAULT_PLACEHOLDERS = frozenset({
     "middlelayer", "middle-layer", "middle_layer",
     "mlxmiddlelayer", "mlx-middle-layer", "mlx_middle_layer", "mlx",
     "lmstudio", "openclaw",
-    # Common cloud ids that arrive from clients but aren't loaded locally.
-    "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-turbo", "gpt-4.1",
-    "claude-3-5-sonnet", "claude-3-opus",
-}
+})
+
+
+def _build_effective_placeholder_models() -> frozenset[str]:
+    """Merge core + optional extras. OpenClaw-specific ids default-on until 0.2.0."""
+    raw = os.environ.get("EXTRA_PLACEHOLDER_MODELS")
+    if raw is None:
+        warnings.warn(
+            "EXTRA_PLACEHOLDER_MODELS is unset: OpenClaw-specific placeholder model "
+            "IDs remain enabled for one minor release. Set EXTRA_PLACEHOLDER_MODELS "
+            "to a comma-separated list (or empty string to disable) for explicit "
+            "control. Defaults change in 0.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        extra = _OPENCLAW_DEFAULT_PLACEHOLDERS
+    elif raw.strip() == "":
+        extra = frozenset()
+    else:
+        extra = frozenset(s.strip().lower() for s in raw.split(",") if s.strip())
+    return frozenset(_CORE_PLACEHOLDER_MODELS | extra)
+
+
+PLACEHOLDER_MODELS = _build_effective_placeholder_models()
 ON_MODEL_MISS = os.environ.get("ON_MODEL_MISS", "fallback").lower()  # "fallback" | "error"
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "").strip()
 MLX_FORCE_DEFAULT_MODEL = os.environ.get("MLX_FORCE_DEFAULT_MODEL", "0").strip().lower() in {

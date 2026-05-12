@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import warnings
 import requests
 import re
 import uuid
@@ -57,19 +58,40 @@ _cached_model_ids = None
 _cached_model_ids_ts = 0
 MODEL_LIST_TTL = int(os.environ.get("MODEL_LIST_TTL", "30"))
 
-# Tokens that mean "you pick a model for me". Includes well-known cloud ids
-# that often arrive from clients like Continue/Cline regardless of what is
-# actually loaded locally.
-PLACEHOLDER_MODELS = {
+# Tokens that mean "you pick a model for me". OpenClaw-specific ids are gated
+# behind EXTRA_PLACEHOLDER_MODELS (see middle_layerMLX.py for the shared policy).
+_CORE_PLACEHOLDER_MODELS = frozenset({
     "", "auto", "default",
-    # OpenClaw provider model ids (any of these means "you pick").
+    "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-turbo", "gpt-4.1",
+    "claude-3-5-sonnet", "claude-3-opus",
+})
+_OPENCLAW_DEFAULT_PLACEHOLDERS = frozenset({
     "middlelayer", "middle-layer", "middle_layer",
     "mlxmiddlelayer", "mlx-middle-layer", "mlx_middle_layer", "mlx",
     "lmstudio", "openclaw",
-    # Common cloud ids that arrive from clients but aren't loaded locally.
-    "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-turbo", "gpt-4.1",
-    "claude-3-5-sonnet", "claude-3-opus",
-}
+})
+
+
+def _build_effective_placeholder_models() -> frozenset[str]:
+    raw = os.environ.get("EXTRA_PLACEHOLDER_MODELS")
+    if raw is None:
+        warnings.warn(
+            "EXTRA_PLACEHOLDER_MODELS is unset: OpenClaw-specific placeholder model "
+            "IDs remain enabled for one minor release. Set EXTRA_PLACEHOLDER_MODELS "
+            "to a comma-separated list (or empty string to disable) for explicit "
+            "control. Defaults change in 0.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        extra = _OPENCLAW_DEFAULT_PLACEHOLDERS
+    elif raw.strip() == "":
+        extra = frozenset()
+    else:
+        extra = frozenset(s.strip().lower() for s in raw.split(",") if s.strip())
+    return frozenset(_CORE_PLACEHOLDER_MODELS | extra)
+
+
+PLACEHOLDER_MODELS = _build_effective_placeholder_models()
 
 # When the client asks for a specific model that is NOT loaded:
 #   "fallback" (default) -> auto-pick another model + add X-Model-Resolution header
@@ -1467,8 +1489,8 @@ def swarm_pipeline():
     )
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+def main() -> None:
+    port = int(os.environ.get("PORT", 5000))
     host = os.environ.get("HOST", "127.0.0.1")
     print(f"Starting middle_layer on port {port}...")
     print(f"Listening on host: {host}")
@@ -1496,7 +1518,6 @@ if __name__ == '__main__':
         for role, prefs in MODEL_ROLES.items():
             print(f"  - {role}: {prefs}")
 
-    # Test connection to LM Studio on startup
     ids, error = get_lmstudio_model_ids(force_refresh=True)
     if error:
         print(f"WARN: {error}")
@@ -1508,3 +1529,7 @@ if __name__ == '__main__':
             print(f"  - {mid}")
 
     app.run(host=host, port=port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

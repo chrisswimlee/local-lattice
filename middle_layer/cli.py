@@ -32,9 +32,14 @@ return whatever it returns (typically ``None``; SystemExit propagates).
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import sys
-from typing import Callable
+from collections.abc import Callable
+
+
+def _package_parent() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 
 
 def _ensure_legacy_on_path() -> None:
@@ -51,8 +56,7 @@ def _ensure_legacy_on_path() -> None:
     directory to ``sys.path[0]`` if the legacy file is co-located
     there. This is a no-op in correctly-installed environments.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.abspath(os.path.join(here, os.pardir))
+    parent = _package_parent()
     candidate = os.path.join(parent, "middle_layerMLX.py")
     if os.path.isfile(candidate) and parent not in sys.path:
         sys.path.insert(0, parent)
@@ -77,6 +81,32 @@ def _legacy_main(module_name: str) -> Callable[[], None]:
     return fn
 
 
+def _legacy_lmstudio_main() -> Callable[[], None]:
+    """Load the LM Studio proxy module without colliding with package ``middle_layer``."""
+    parent = _package_parent()
+    candidates = [
+        os.path.join(parent, "middle_layer_lmstudio.py"),
+        os.path.join(parent, "middle_layer.py"),
+    ]
+    path = next((p for p in candidates if os.path.isfile(p)), None)
+    if path is None:  # pragma: no cover
+        raise SystemExit(
+            "middle-layer-lmstudio: could not find middle_layer.py (or "
+            "middle_layer_lmstudio.py) next to the installed package."
+        )
+    mod_name = "middle_layer_legacy_lmstudio"
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover
+        raise SystemExit(f"middle-layer-lmstudio: could not load spec for {path!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    fn = getattr(module, "main", None)
+    if not callable(fn):
+        raise SystemExit("middle-layer-lmstudio: legacy LM Studio module has no callable main().")
+    return fn
+
+
 def main_mlx() -> None:
     """Entry point: ``middle-layer-mlx`` — MLX backend."""
     _legacy_main("middle_layerMLX")()
@@ -84,7 +114,7 @@ def main_mlx() -> None:
 
 def main_lmstudio() -> None:
     """Entry point: ``middle-layer-lmstudio`` — legacy LM Studio proxy."""
-    _legacy_main("middle_layer")()
+    _legacy_lmstudio_main()()
 
 
 def main() -> None:

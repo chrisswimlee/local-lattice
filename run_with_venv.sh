@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Create .venv if missing, install deps, run middle_layerMLX with that Python.
+# Deprecated: create .venv and pip install -e ".[mlx]" then ./scripts/start.sh --profile mlx
+echo "DeprecationWarning: run_with_venv.sh is deprecated; use ./scripts/start.sh --profile mlx after pip install -e '.[mlx]'" >&2
 set -euo pipefail
 ML_HOME="$(cd "$(dirname "$0")" && pwd)"
 WS_ROOT="$(cd "$ML_HOME/.." && pwd)"
@@ -16,6 +17,4 @@ if [[ ! -f "$VENV/bin/python" ]]; then
 fi
 "$VENV/bin/python" -m pip install -q -U pip
 "$VENV/bin/python" -m pip install -q -r "$ML_HOME/requirements-mlx-gateway.txt"
-export HOST="${HOST:-127.0.0.1}"
-export PORT="${PORT:-5001}"
-exec "$VENV/bin/python" "$ML_HOME/middle_layerMLX.py" serve "$@"
+exec "$ML_HOME/scripts/start.sh" --profile mlx "$@"
