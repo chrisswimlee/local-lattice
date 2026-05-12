@@ -1,23 +1,20 @@
 #!/bin/bash
-# setup_mlx.sh — One-command setup for middle_layerMLX on any Apple Silicon Mac.
-#
-# Usage:
-#   bash setup_mlx.sh                              # just install deps
-#   bash setup_mlx.sh mlx-community/Qwen3-8B-MLX  # install + download + serve
+# Deprecated: use pip install -e ".[mlx]" and ./scripts/start.sh --profile mlx
+echo "DeprecationWarning: setup_mlx.sh is deprecated; use pip install -e '.[mlx]' and ./scripts/start.sh --profile mlx" >&2
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "=== middle_layerMLX setup ==="
+echo "=== MiddleLayer MLX setup (legacy entry point) ==="
 echo "Working directory: $SCRIPT_DIR"
 
-# Create venv if missing
 if [ ! -d .venv ]; then
   echo "Creating Python venv..."
   python3 -m venv .venv
 fi
 
+# shellcheck source=/dev/null
 source .venv/bin/activate
 
 echo "Installing dependencies..."
@@ -37,12 +34,7 @@ else
   echo ""
   echo "Setup complete. Next steps:"
   echo ""
-  echo "  # Single model (e.g. on a remote machine):"
+  echo "  ./scripts/start.sh --profile mlx"
+  echo "  # or with grab:"
   echo "  python3 middle_layerMLX.py serve --grab mlx-community/Qwen3-8B-MLX"
-  echo ""
-  echo "  # Multi-model with swarm (e.g. on your M5 Max):"
-  echo "  python3 middle_layerMLX.py serve --model-root ~/.lmstudio/models"
-  echo ""
-  echo "  # Download a model first:"
-  echo "  python3 middle_layerMLX.py download mlx-community/Qwen3-8B-MLX"
 fi

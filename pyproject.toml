@@ -135,6 +135,7 @@ packages = ["middle_layer"]
 [tool.hatch.build.targets.sdist]
 include = [
     "/middle_layer",
+    "/tests",
     "/middle_layerMLX.py",
     "/middle_layer.py",
     "/mlx_dashboard.py",
@@ -147,6 +148,7 @@ include = [
     "/CONTRIBUTING.md",
     "/CODE_OF_CONDUCT.md",
     "/SECURITY.md",
+    "/AGENTS.md",
     "/LICENSE",
     "/NOTICE",
     "/pyproject.toml",
