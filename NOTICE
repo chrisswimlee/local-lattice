@@ -1,0 +1,30 @@
+MiddleLayer
+Copyright 2026 The MiddleLayer Authors
+
+This product includes software developed by the MiddleLayer project
+contributors.
+
+This product, when configured with optional dependencies, may communicate
+with the following third-party services or load the following third-party
+software components at runtime. None of these are bundled with this
+distribution; they are listed for transparency.
+
+- Apple `mlx-lm` (MIT). Used when the `[mlx]` extra is installed. Loads
+  user-supplied model weights from disk into Apple Silicon GPUs.
+- LM Studio (proprietary, optional upstream). MiddleLayer can act as an
+  OpenAI-compatible proxy in front of a running LM Studio instance via
+  the `[lmstudio]` extra; LM Studio itself is not bundled.
+- Anthropic API (proprietary, optional upstream). MiddleLayer can
+  optionally escalate "big task" requests to Anthropic Claude via
+  `litellm` when the `[anthropic]` extra is installed and a user-supplied
+  API key is provided. No request data is sent to Anthropic unless the
+  operator explicitly enables routing.
+- Hugging Face `huggingface_hub` (Apache-2.0). Used to download MLX
+  model weights when grab/download paths are invoked.
+- Flask (BSD-3-Clause), Werkzeug (BSD-3-Clause), `flask-cors`
+  (MIT), `litellm` (MIT) — runtime web framework and optional helpers.
+
+Where any of the above components are themselves under non-Apache-2.0
+licenses, their license terms apply to their portion of any derived
+distribution. The Apache-2.0 license in this repository covers only the
+MiddleLayer source code.
