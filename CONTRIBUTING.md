@@ -11,8 +11,8 @@ why-we-do-things-this-way lives in the [pass documentation under
 ## Quick start for contributors
 
 ```bash
-git clone https://github.com/middle-layer/middle-layer.git
-cd middle-layer
+git clone https://github.com/chrisswimlee/local-lattice.git
+cd local-lattice
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[all]"            # cross-platform dev set
@@ -145,9 +145,9 @@ If your PR adds or changes a configuration knob:
 
 A good bug report:
 
-- The MiddleLayer version (`middle-layer-mlx --version`) and Python
+- The Local Lattice / MiddleLayer version (`local-lattice-mlx --version` or `middle-layer-mlx --version`) and Python
   version.
-- The relevant `Settings` (run `middle-layer-mlx config show` once
+- The relevant `Settings` (run `local-lattice-mlx config show` once
   Pass 2 ships) **or** the env vars you set, with secrets redacted.
 - A minimal reproduction: ideally a `curl` command and the response.
 - For routing issues, the contents of `model_profiles.json` and

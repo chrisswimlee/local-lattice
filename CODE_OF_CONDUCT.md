@@ -59,9 +59,10 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-**conduct@middle-layer.invalid** (replace with a working address before the
-repository is made public — tracked in Pass 1 PR).
+reported to the community leaders responsible for enforcement by:
+
+1. **[Opening a GitHub issue](https://github.com/chrisswimlee/local-lattice/issues/new)** with the title prefix `[Code of Conduct]` (avoid including sensitive personal details in the public body), **or**
+2. Contacting the repository owner via their [GitHub profile](https://github.com/chrisswimlee) using any contact method they publish there.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

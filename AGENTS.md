@@ -41,6 +41,6 @@ to `main`; regenerate locally when needed.
 
 ## URLs
 
-The canonical GitHub home may move (org vs personal fork). If `README.md`,
-`pyproject.toml` `[project.urls]`, and `git remote` disagree, treat that as a
-**known TODO** until maintainers align them.
+Canonical GitHub home: **https://github.com/chrisswimlee/local-lattice**. The
+PyPI package name is **`local-lattice`**; keep `README.md`, `pyproject.toml`
+`[project.urls]`, and `git remote origin` in sync when the canonical org moves.

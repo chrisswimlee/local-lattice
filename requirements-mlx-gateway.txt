@@ -1,4 +1,4 @@
-# DEPRECATED — use `pip install middle-layer[mlx,anthropic]` instead.
+# DEPRECATED — use `pip install local-lattice[mlx,anthropic]` instead.
 #
 # This file is a thin compatibility shim kept for one minor version so
 # existing tooling that runs `pip install -r requirements-mlx-gateway.txt`
@@ -6,6 +6,6 @@
 # the `[mlx]` and `[anthropic]` extras, matching the previous
 # everything-but-LM-Studio footprint. See `pyproject.toml`.
 #
-# Will be removed in 0.2.0.
+# Will be removed in 0.3.0.
 
 --editable .[mlx,anthropic]

@@ -5,7 +5,7 @@
 #   ./scripts/start.sh --profile lmstudio
 #   ./scripts/start.sh --profile stable          # MLX + safe stability defaults
 #   ./scripts/start.sh --profile stable=balanced # explicit stability tier
-# Extra args after -- are forwarded to the backend (MLX: middle-layer-mlx / python).
+# Extra args after -- are forwarded to the backend (MLX: local-lattice-mlx / middle-layer-mlx / python).
 
 set -euo pipefail
 
@@ -76,6 +76,9 @@ case "$PROFILE" in
       fi
     fi
     echo "MiddleLayer (profile=mlx) — http://$HOST:$PORT"
+    if command -v local-lattice-mlx >/dev/null 2>&1; then
+      exec local-lattice-mlx serve --host "$HOST" --port "$PORT" "${FORWARD[@]}"
+    fi
     if command -v middle-layer-mlx >/dev/null 2>&1; then
       exec middle-layer-mlx serve --host "$HOST" --port "$PORT" "${FORWARD[@]}"
     fi
@@ -141,6 +144,9 @@ case "$PROFILE" in
       fi
     fi
     echo "MiddleLayer (profile=stable, MLX_STABILITY_PROFILE=$MLX_STABILITY_PROFILE) — http://$HOST:$PORT"
+    if command -v local-lattice-mlx >/dev/null 2>&1; then
+      exec local-lattice-mlx serve --host "$HOST" --port "$PORT" "${FORWARD[@]}"
+    fi
     if command -v middle-layer-mlx >/dev/null 2>&1; then
       exec middle-layer-mlx serve --host "$HOST" --port "$PORT" "${FORWARD[@]}"
     fi
@@ -173,6 +179,9 @@ case "$PROFILE" in
     export SWARM_CHAT_DEFAULT_MODELS="${SWARM_CHAT_DEFAULT_MODELS:-role:fast}"
     export SWARM_CHAT_DEFAULT_STRATEGY="${SWARM_CHAT_DEFAULT_STRATEGY:-first-success}"
     echo "MiddleLayer (profile=lmstudio) — PORT=$PORT LM_STUDIO_URL=$LM_STUDIO_URL"
+    if command -v local-lattice-lmstudio >/dev/null 2>&1; then
+      exec local-lattice-lmstudio "${FORWARD[@]}"
+    fi
     if command -v middle-layer-lmstudio >/dev/null 2>&1; then
       exec middle-layer-lmstudio "${FORWARD[@]}"
     fi

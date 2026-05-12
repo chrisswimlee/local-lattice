@@ -1,4 +1,4 @@
-"""Console-script entry point for ``middle-layer-mlx``.
+"""Console-script entry points for ``local-lattice-mlx`` / ``middle-layer-mlx``.
 
 Pass 1 transitional shim. The real CLI definition still lives in
 ``middle_layerMLX._build_cli`` at the repository root; this module
@@ -6,9 +6,9 @@ forwards into it without modification, so
 
 ::
 
-    middle-layer-mlx serve --help
+    local-lattice-mlx serve --help
 
-prints exactly the same help as
+(and ``middle-layer-mlx serve --help``) prints exactly the same help as
 
 ::
 
@@ -68,14 +68,14 @@ def _legacy_main(module_name: str) -> Callable[[], None]:
         module = importlib.import_module(module_name)
     except ImportError as exc:  # pragma: no cover - import-time wiring
         raise SystemExit(
-            f"middle-layer-mlx: could not import legacy module {module_name!r}: "
+            f"local-lattice-mlx: could not import legacy module {module_name!r}: "
             f"{exc}. Reinstall the package or run `python {module_name}.py serve` "
             "directly from a source checkout."
         ) from exc
     fn = getattr(module, "main", None)
     if not callable(fn):
         raise SystemExit(
-            f"middle-layer-mlx: legacy module {module_name!r} has no callable "
+            f"local-lattice-mlx: legacy module {module_name!r} has no callable "
             "main(); reinstall the package."
         )
     return fn
@@ -91,29 +91,31 @@ def _legacy_lmstudio_main() -> Callable[[], None]:
     path = next((p for p in candidates if os.path.isfile(p)), None)
     if path is None:  # pragma: no cover
         raise SystemExit(
-            "middle-layer-lmstudio: could not find middle_layer.py (or "
+            "local-lattice-lmstudio: could not find middle_layer.py (or "
             "middle_layer_lmstudio.py) next to the installed package."
         )
     mod_name = "middle_layer_legacy_lmstudio"
     spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:  # pragma: no cover
-        raise SystemExit(f"middle-layer-lmstudio: could not load spec for {path!r}")
+        raise SystemExit(f"local-lattice-lmstudio: could not load spec for {path!r}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module
     spec.loader.exec_module(module)
     fn = getattr(module, "main", None)
     if not callable(fn):
-        raise SystemExit("middle-layer-lmstudio: legacy LM Studio module has no callable main().")
+        raise SystemExit(
+            "local-lattice-lmstudio: legacy LM Studio module has no callable main()."
+        )
     return fn
 
 
 def main_mlx() -> None:
-    """Entry point: ``middle-layer-mlx`` — MLX backend."""
+    """Entry point: ``local-lattice-mlx`` / ``middle-layer-mlx`` — MLX backend."""
     _legacy_main("middle_layerMLX")()
 
 
 def main_lmstudio() -> None:
-    """Entry point: ``middle-layer-lmstudio`` — legacy LM Studio proxy."""
+    """Entry point: ``local-lattice-lmstudio`` / ``middle-layer-lmstudio`` — legacy LM Studio proxy."""
     _legacy_lmstudio_main()()
 
 

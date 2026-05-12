@@ -9,9 +9,8 @@ queue, and a hybrid local-plus-cloud swarm — built for Apple Silicon.**
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Project status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-> **Repository URL:** README links may reference `github.com/middle-layer/middle-layer`
-> while the live remote is `github.com/chrisswimlee/local-lattice`. Maintainers
-> will align canonical URLs before a public announcement.
+**Canonical repository:** [github.com/chrisswimlee/local-lattice](https://github.com/chrisswimlee/local-lattice).
+The PyPI distribution name is **`local-lattice`**; the importable Python package remains **`middle_layer`** until Pass 3.
 
 MiddleLayer is a small Flask server that speaks the OpenAI HTTP API but runs
 your models directly via [Apple `mlx_lm`](https://github.com/ml-explore/mlx).
@@ -21,7 +20,7 @@ bounded admission queue with per-model concurrency caps, a hybrid local-plus-
 cloud "swarm" (`/swarm/fanout|vote|pipeline|debate`), an in-process metrics
 dashboard, and optional escalation to Anthropic Claude for long-form work.
 
-> **Status (0.1.0): alpha.** The HTTP surface is stable in practice (every
+> **Status (0.2.0): alpha.** The HTTP surface is stable in practice (every
 > route is pinned by `docs/_internal/baseline/` regression captures) but the
 > Python API and internal module layout will change before 1.0. Pin the
 > version if you embed this.
@@ -29,8 +28,8 @@ dashboard, and optional escalation to Anthropic Claude for long-form work.
 ## 30-second quickstart
 
 ```bash
-git clone https://github.com/middle-layer/middle-layer.git
-cd middle-layer
+git clone https://github.com/chrisswimlee/local-lattice.git
+cd local-lattice
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[mlx]"     # Apple Silicon only; use `[lmstudio]` elsewhere
@@ -39,7 +38,8 @@ pip install -e ".[mlx]"     # Apple Silicon only; use `[lmstudio]` elsewhere
 export MLX_MODEL_ROOT="$HOME/.lmstudio/models"
 export MIDDLE_LAYER_API_KEY="$(uuidgen)"   # enable auth; deny-by-default
 
-middle-layer-mlx serve --host 127.0.0.1 --port 5001
+local-lattice-mlx serve --host 127.0.0.1 --port 5001
+# back-compat: middle-layer-mlx is the same entry point
 ```
 
 In another shell:
@@ -97,7 +97,7 @@ pip install -e ".[lmstudio,anthropic]"
 ```
 
 This installs the cross-platform pieces only (no `mlx_lm`). The
-`middle-layer-lmstudio` console script runs the legacy proxy that talks
+`local-lattice-lmstudio` console script (alias: `middle-layer-lmstudio`) runs the legacy proxy that talks
 to a separate LM Studio instance at `LM_STUDIO_URL=http://127.0.0.1:1234`.
 
 ### Everything cross-platform
@@ -111,7 +111,7 @@ pip install -e ".[all]"   # equivalent to [lmstudio,anthropic,dashboard,dev]
 For one minor version we still honour the previous workflow:
 
 ```bash
-pip install -r requirements-mlx.txt           # == pip install -e .[mlx]
+pip install -r requirements-mlx.txt           # == pip install -e .[mlx] (local-lattice)
 pip install -r requirements-mlx-gateway.txt   # == pip install -e .[mlx,anthropic]
 ```
 

@@ -12,15 +12,31 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
-Migration umbrella for everything between 0.1.0 and 0.2.0. See
-`README.md` for the per-pass roadmap.
-
 ### Pass 2 (planned)
 - Configuration consolidation under `middle_layer.config.Settings`
   (`pydantic-settings`).
 - Documented deprecation of every flat env var in favour of
   `MIDDLE_LAYER_<SECTION>_<KEY>` while keeping the old names as
   shims with `DeprecationWarning`.
+
+## [0.2.0] — 2026-05-12
+
+### Changed
+
+- **PyPI distribution** is now **`local-lattice`** (was `middle-layer` during early
+  Pass 1 drafts). Install with `pip install "local-lattice[mlx]"` etc.
+- **Console scripts:** canonical **`local-lattice-mlx`** and **`local-lattice-lmstudio`**;
+  **`middle-layer-mlx`** and **`middle-layer-lmstudio`** remain as identical
+  entry-point aliases for OpenClaw and existing automation (scheduled removal
+  after one minor with `DeprecationWarning` once callers migrate).
+- **`[project.urls]`**, README, and CONTRIBUTING clone commands now use
+  **`https://github.com/chrisswimlee/local-lattice`**.
+- **Security / Code of Conduct:** placeholder `@*.invalid` addresses replaced with
+  GitHub private vulnerability reporting and documented issue-based CoC intake.
+
+### Docs
+
+- README **Status** line bumped to 0.2.0; quickstart uses `local-lattice` paths.
 
 ## [0.1.0] — 2026-05-12
 
@@ -102,5 +118,6 @@ captured by the Pass 0 baseline (`docs/_internal/baseline/` on
   `127.0.0.1` should set `MIDDLE_LAYER_API_KEY` and put TLS in
   front of the gateway. See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/chrisswimlee/local-lattice/commits/main/
+[Unreleased]: https://github.com/chrisswimlee/local-lattice/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/chrisswimlee/local-lattice/releases
 [0.1.0]: https://github.com/chrisswimlee/local-lattice/releases
