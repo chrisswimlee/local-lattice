@@ -1,0 +1,11 @@
+=== /swarm/pipeline (single step) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:32:07 GMT
+X-Swarm-Strategy: pipeline
+X-Swarm-Steps: step_0
+Content-Type: application/json
+Content-Length: 465
+Connection: close
+
+{"id": "chatcmpl_70ee66b599664fb9908effb021db36e7", "object": "chat.completion", "created": 1778592727, "model": "swarm/pipeline/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Sure, I'd be"}, "finish_reason": "stop"}], "swarm": {"strategy": "pipeline", "history": [{"name": "step_0", "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "text": "Sure, I'd be", "latency_ms": 2240}]}}

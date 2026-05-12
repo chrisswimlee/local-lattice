@@ -1,0 +1,12 @@
+=== /v1/chat/completions non-streaming (loads model first time) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:31:25 GMT
+X-Model-Routed-To: mlx/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx
+X-MLX-Latency-Ms: 640
+X-MLX-Queue-Wait-Ms: 0
+Content-Type: application/json
+Content-Length: 345
+Connection: close
+
+{"id": "chatcmpl_02eaad7e9f344208a82f27885e442cdd", "object": "chat.completion", "created": 1778592685, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "PONG"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 19, "completion_tokens": 2, "total_tokens": 21}}

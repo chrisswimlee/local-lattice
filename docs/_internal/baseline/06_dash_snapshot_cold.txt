@@ -1,0 +1,92 @@
+=== /dashboard/api/snapshot (cold) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:31:13 GMT
+Content-Type: application/json
+Content-Length: 2682
+Connection: close
+
+{
+  "dashboard_enabled": true,
+  "note": "This dashboard shows routing and I/O metadata only, not internal chain-of-thought.",
+  "mlx_available": true,
+  "grab_mode": false,
+  "mlx_root": "/Users/chrisswimlee/.lmstudio/models",
+  "models_available": [
+    "mlx-community/Qwen3.6-27B-8bit",
+    "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
+    "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-4bit",
+    "mlx-community/granite-4.1-8b-6bit",
+    "mlx-community/granite-4.1-30b-8bit",
+    "mlx-community/gemma-4-e4b-it-OptiQ-4bit",
+    "mlx-community/gemma-4-31b-it-8bit",
+    "mlx-community/gemma-4-26b-a4b-it-8bit",
+    "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+    "mlx-community/Qwen3.6-35B-A3B-8bit",
+    "mlx-community/Qwen3.5-9B-OptiQ-4bit",
+    "mlx-community/gpt-oss-20b-MXFP4-Q8",
+    "mlx-community/Qwen3.5-122B-A10B-5bit",
+    "mlx-community/gpt-oss-120b-mxfp4-bf16",
+    "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
+    "lmstudio-community/Hermes-4-70B-MLX-4bit",
+    "lmstudio-community/LFM2-24B-A2B-MLX-8bit"
+  ],
+  "models_loaded": [],
+  "memory": {
+    "loaded": [],
+    "count": 0,
+    "max": 1
+  },
+  "active_by_alias": {},
+  "events": [],
+  "preferences": {
+    "default_model": null,
+    "swarm_presets": {}
+  },
+  "config": {
+    "model_roles": {
+      "_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing model wins. Exact ids beat substrings (substring 'fast' would also match e.g. 'fast-7b' if it existed). Tune to your loaded set.",
+      "fast": [
+        "nemotron-mini-4b-instruct-mlx",
+        "gemma-4-e4b-it-optiq",
+        "granite-4.1-8b",
+        "qwen3.5-9b-optiq"
+      ],
+      "coder": [
+        "qwen/qwen3-coder-next",
+        "coder"
+      ],
+      "reasoner": [
+        "qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking",
+        "nousresearch/hermes-4-70b",
+        "openai/gpt-oss-20b",
+        "granite-4.1-30b"
+      ],
+      "vision": [
+        "vl",
+        "vision",
+        "llava"
+      ],
+      "default": [
+        "granite-4.1-8b",
+        "qwen3.5-9b-optiq"
+      ]
+    },
+    "default_model_env": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+    "max_concurrent_models": 1,
+    "max_parallel_model_calls": 1,
+    "swarm_fanout_timeout_sec": null,
+    "swarm_fanout_budget_example_sec": 540.0,
+    "anthropic_enabled": false,
+    "admission": {
+      "enabled": true,
+      "inflight_cap_per_model": 1,
+      "queue_max_per_model": 32,
+      "queue_max_total": 128,
+      "inflight_total": 0,
+      "queued_total": 0,
+      "inflight_by_alias": {},
+      "queued_by_alias": {}
+    }
+  }
+}

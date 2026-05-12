@@ -1,0 +1,9 @@
+=== unauth /healthz ===
+HTTP/1.1 401 UNAUTHORIZED
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:31:13 GMT
+Content-Type: application/json
+Content-Length: 25
+Connection: close
+
+{"error": "Unauthorized"}

@@ -1,0 +1,509 @@
+=== final dashboard snapshot ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:34:53 GMT
+Content-Type: application/json
+Content-Length: 16275
+Connection: close
+
+{
+  "dashboard_enabled": true,
+  "note": "This dashboard shows routing and I/O metadata only, not internal chain-of-thought.",
+  "mlx_available": true,
+  "grab_mode": false,
+  "mlx_root": "/Users/chrisswimlee/.lmstudio/models",
+  "models_available": [
+    "mlx-community/Qwen3.6-27B-8bit",
+    "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
+    "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-4bit",
+    "mlx-community/granite-4.1-8b-6bit",
+    "mlx-community/granite-4.1-30b-8bit",
+    "mlx-community/gemma-4-e4b-it-OptiQ-4bit",
+    "mlx-community/gemma-4-31b-it-8bit",
+    "mlx-community/gemma-4-26b-a4b-it-8bit",
+    "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+    "mlx-community/Qwen3.6-35B-A3B-8bit",
+    "mlx-community/Qwen3.5-9B-OptiQ-4bit",
+    "mlx-community/gpt-oss-20b-MXFP4-Q8",
+    "mlx-community/Qwen3.5-122B-A10B-5bit",
+    "mlx-community/gpt-oss-120b-mxfp4-bf16",
+    "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
+    "lmstudio-community/Hermes-4-70B-MLX-4bit",
+    "lmstudio-community/LFM2-24B-A2B-MLX-8bit"
+  ],
+  "models_loaded": [
+    "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx"
+  ],
+  "memory": {
+    "loaded": [
+      "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx"
+    ],
+    "count": 1,
+    "max": 1
+  },
+  "active_by_alias": {
+    "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx": 0,
+    "mlx-community/Qwen3.6-27B-8bit": 0
+  },
+  "events": [
+    {
+      "request_id": "2204e1c0-fdc6-4ace-8edf-33a2f6b36b57",
+      "parent_request_id": null,
+      "agent_slot": null,
+      "route_kind": "chat_mlx",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 19,
+      "completion_tokens": 2,
+      "total_tokens": 21,
+      "latency_ms": 640,
+      "tokens_per_sec": 3.125,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 32,
+        "last_user_preview": "Reply with the single word: PONG"
+      },
+      "ts": 1778592685.728894
+    },
+    {
+      "request_id": "1402d7b0-fd01-48c3-96eb-3643785bfeb7",
+      "parent_request_id": null,
+      "agent_slot": null,
+      "route_kind": "chat_mlx_stream",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": true,
+      "prompt_tokens": 16,
+      "completion_tokens": 3,
+      "total_tokens": 19,
+      "latency_ms": 172,
+      "tokens_per_sec": 17.442,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 23,
+        "last_user_preview": "Reply with: HELLO WORLD"
+      },
+      "ts": 1778592707.940964
+    },
+    {
+      "request_id": "82042e94-9445-47a3-be38-0ad9f3b619aa",
+      "parent_request_id": null,
+      "agent_slot": null,
+      "route_kind": "chat_mlx",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 22,
+      "completion_tokens": 2,
+      "total_tokens": 24,
+      "latency_ms": 139,
+      "tokens_per_sec": 14.388,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 18,
+        "last_user_preview": "Continue: 1, 2, 3,"
+      },
+      "ts": 1778592708.0888782
+    },
+    {
+      "request_id": "ea8f4282-73fb-4788-9657-d93b802bdc90",
+      "parent_request_id": null,
+      "agent_slot": null,
+      "route_kind": "chat_mlx",
+      "requested_model": "gpt-9000-imaginary",
+      "resolved_model": "mlx-community/Qwen3.6-27B-8bit",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 11,
+      "completion_tokens": 4,
+      "total_tokens": 15,
+      "latency_ms": 4116,
+      "tokens_per_sec": 0.972,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 2,
+        "last_user_preview": "hi"
+      },
+      "ts": 1778592724.867142
+    },
+    {
+      "request_id": "4ccb0793-4518-4db2-8e27-c05768fe54bc_step0",
+      "parent_request_id": "4ccb0793-4518-4db2-8e27-c05768fe54bc",
+      "agent_slot": 0,
+      "route_kind": "swarm_pipeline",
+      "requested_model": "None",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 15,
+      "completion_tokens": 6,
+      "total_tokens": 21,
+      "latency_ms": 2240,
+      "tokens_per_sec": 2.679,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: C"
+      },
+      "extra": {
+        "step_name": "step_0"
+      },
+      "ts": 1778592727.160332
+    },
+    {
+      "request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656_slot0",
+      "parent_request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656",
+      "agent_slot": 0,
+      "route_kind": "swarm_debate_round_1",
+      "requested_model": "role:reasoner",
+      "resolved_model": "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 14,
+      "completion_tokens": 4,
+      "total_tokens": 18,
+      "latency_ms": 9300,
+      "tokens_per_sec": 0.43,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: D"
+      },
+      "ts": 1778592736.4693031
+    },
+    {
+      "request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656_slot1",
+      "parent_request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656",
+      "agent_slot": 1,
+      "route_kind": "swarm_debate_round_1",
+      "requested_model": "role:fast",
+      "resolved_model": "mlx-community/gemma-4-e4b-it-OptiQ-4bit",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "latency_ms": 21,
+      "tokens_per_sec": null,
+      "status": "error",
+      "error": "Failed to load MLX model 'mlx-community/gemma-4-e4b-it-OptiQ-4bit': Received 126 parameters not in model: \nmodel.layers.24.self_attn.k_norm.weight,\nmodel.layers.24.self_attn.k_proj.biases,\nmodel.layers.24.self_attn.k_proj.scales,\nmodel.layers.24.self_attn.k_proj.weight,\nmodel.layers.24.self_attn.v_proj.biases,\nmodel.layers.24.self_attn.v_proj.scales,\nmodel.layers.24.self_attn.v_proj.weight,\nmodel.layers.25.self_attn.k_norm.weight,\nmodel.layers.25.self_attn.k_proj.biases,\nmodel.layers.25.self_att",
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: D"
+      },
+      "ts": 1778592736.490676
+    },
+    {
+      "request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656_slot2",
+      "parent_request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656",
+      "agent_slot": 2,
+      "route_kind": "swarm_debate_round_1",
+      "requested_model": "role:coder",
+      "resolved_model": "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 12,
+      "completion_tokens": 1,
+      "total_tokens": 13,
+      "latency_ms": 92686,
+      "tokens_per_sec": 0.011,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: D"
+      },
+      "ts": 1778592829.497163
+    },
+    {
+      "request_id": "033aa5b1-5550-48dc-b0dc-9d7939291392",
+      "parent_request_id": null,
+      "agent_slot": null,
+      "route_kind": "chat_mlx",
+      "requested_model": "auto",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 15,
+      "completion_tokens": 4,
+      "total_tokens": 19,
+      "latency_ms": 812,
+      "tokens_per_sec": 4.926,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 11,
+        "last_user_preview": "Say only: F"
+      },
+      "ts": 1778592830.826433
+    },
+    {
+      "request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656_judge",
+      "parent_request_id": "e71c784c-4f6c-4112-8ad1-6e2dabaec656",
+      "agent_slot": null,
+      "route_kind": "swarm_debate_judge",
+      "requested_model": "role:reasoner",
+      "resolved_model": "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 135,
+      "completion_tokens": 4,
+      "total_tokens": 139,
+      "latency_ms": 1237,
+      "tokens_per_sec": 3.234,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "system": 1,
+          "user": 1
+        },
+        "last_user_chars": 228,
+        "last_user_preview": "Original question:\nReply only: D\n\nDebate transcript:\n[Round 1 - mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit]: The user is asking\n\n[Round 1 - lmstudio-community/Q"
+      },
+      "ts": 1778592835.5862882
+    },
+    {
+      "request_id": "cd8e27ef-ad66-4d2f-959f-67552698ab14_slot0",
+      "parent_request_id": "cd8e27ef-ad66-4d2f-959f-67552698ab14",
+      "agent_slot": 0,
+      "route_kind": "swarm_fanout",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 15,
+      "completion_tokens": 1,
+      "total_tokens": 16,
+      "latency_ms": 1658,
+      "tokens_per_sec": 0.603,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: A"
+      },
+      "ts": 1778592885.4141529
+    },
+    {
+      "request_id": "91c3bf7d-3b8d-4b73-a872-b52b043388fc_slot0",
+      "parent_request_id": "91c3bf7d-3b8d-4b73-a872-b52b043388fc",
+      "agent_slot": 0,
+      "route_kind": "swarm_vote",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 15,
+      "completion_tokens": 1,
+      "total_tokens": 16,
+      "latency_ms": 147,
+      "tokens_per_sec": 6.803,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: B"
+      },
+      "ts": 1778592885.570508
+    },
+    {
+      "request_id": "24cf4f93-481b-472e-98f3-4c1fcc380aae_slot0",
+      "parent_request_id": "24cf4f93-481b-472e-98f3-4c1fcc380aae",
+      "agent_slot": 0,
+      "route_kind": "swarm_debate_round_1",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 15,
+      "completion_tokens": 1,
+      "total_tokens": 16,
+      "latency_ms": 137,
+      "tokens_per_sec": 7.299,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: D"
+      },
+      "ts": 1778592885.716608
+    },
+    {
+      "request_id": "24cf4f93-481b-472e-98f3-4c1fcc380aae_slot1",
+      "parent_request_id": "24cf4f93-481b-472e-98f3-4c1fcc380aae",
+      "agent_slot": 1,
+      "route_kind": "swarm_debate_round_1",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 15,
+      "completion_tokens": 1,
+      "total_tokens": 16,
+      "latency_ms": 125,
+      "tokens_per_sec": 8.0,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 13,
+        "last_user_preview": "Reply only: D"
+      },
+      "ts": 1778592885.841662
+    },
+    {
+      "request_id": "24cf4f93-481b-472e-98f3-4c1fcc380aae_judge",
+      "parent_request_id": "24cf4f93-481b-472e-98f3-4c1fcc380aae",
+      "agent_slot": null,
+      "route_kind": "swarm_debate_judge",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 120,
+      "completion_tokens": 6,
+      "total_tokens": 126,
+      "latency_ms": 157,
+      "tokens_per_sec": 38.217,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "system": 1,
+          "user": 1
+        },
+        "last_user_chars": 181,
+        "last_user_preview": "Original question:\nReply only: D\n\nDebate transcript:\n[Round 1 - mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx]: D\n\n[Round 1 - mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx]: D"
+      },
+      "ts": 1778592885.99976
+    },
+    {
+      "request_id": "5c6c2dd6-2081-496c-ab15-b993c739a93b",
+      "parent_request_id": null,
+      "agent_slot": null,
+      "route_kind": "chat_mlx",
+      "requested_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "resolved_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+      "backend": "mlx",
+      "stream": false,
+      "prompt_tokens": 30011,
+      "completion_tokens": 4,
+      "total_tokens": 30015,
+      "latency_ms": 7114,
+      "tokens_per_sec": 0.562,
+      "status": "ok",
+      "error": null,
+      "preview": {
+        "role_counts": {
+          "user": 1
+        },
+        "last_user_chars": 60000,
+        "last_user_preview": "x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x "
+      },
+      "ts": 1778592893.167268
+    }
+  ],
+  "preferences": {
+    "default_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+    "swarm_presets": {
+      "baseline": [
+        "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx"
+      ]
+    }
+  },
+  "config": {
+    "model_roles": {
+      "_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing model wins. Exact ids beat substrings (substring 'fast' would also match e.g. 'fast-7b' if it existed). Tune to your loaded set.",
+      "fast": [
+        "nemotron-mini-4b-instruct-mlx",
+        "gemma-4-e4b-it-optiq",
+        "granite-4.1-8b",
+        "qwen3.5-9b-optiq"
+      ],
+      "coder": [
+        "qwen/qwen3-coder-next",
+        "coder"
+      ],
+      "reasoner": [
+        "qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking",
+        "nousresearch/hermes-4-70b",
+        "openai/gpt-oss-20b",
+        "granite-4.1-30b"
+      ],
+      "vision": [
+        "vl",
+        "vision",
+        "llava"
+      ],
+      "default": [
+        "granite-4.1-8b",
+        "qwen3.5-9b-optiq"
+      ]
+    },
+    "default_model_env": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+    "max_concurrent_models": 1,
+    "max_parallel_model_calls": 1,
+    "swarm_fanout_timeout_sec": null,
+    "swarm_fanout_budget_example_sec": 540.0,
+    "anthropic_enabled": false,
+    "admission": {
+      "enabled": true,
+      "inflight_cap_per_model": 1,
+      "queue_max_per_model": 32,
+      "queue_max_total": 128,
+      "inflight_total": 0,
+      "queued_total": 0,
+      "inflight_by_alias": {},
+      "queued_by_alias": {}
+    }
+  }
+}

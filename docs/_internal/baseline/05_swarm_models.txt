@@ -1,0 +1,9 @@
+=== /swarm/models ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:31:13 GMT
+Content-Type: application/json
+Content-Length: 1749
+Connection: close
+
+{"models": ["mlx-community/Qwen3.6-27B-8bit", "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit", "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-4bit", "mlx-community/granite-4.1-8b-6bit", "mlx-community/granite-4.1-30b-8bit", "mlx-community/gemma-4-e4b-it-OptiQ-4bit", "mlx-community/gemma-4-31b-it-8bit", "mlx-community/gemma-4-26b-a4b-it-8bit", "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "mlx-community/Qwen3.6-35B-A3B-8bit", "mlx-community/Qwen3.5-9B-OptiQ-4bit", "mlx-community/gpt-oss-20b-MXFP4-Q8", "mlx-community/Qwen3.5-122B-A10B-5bit", "mlx-community/gpt-oss-120b-mxfp4-bf16", "lmstudio-community/Qwen3-Coder-Next-MLX-8bit", "lmstudio-community/Hermes-4-70B-MLX-4bit", "lmstudio-community/LFM2-24B-A2B-MLX-8bit"], "loaded": [], "roles": {"_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing model wins. Exact ids beat substrings (substring 'fast' would also match e.g. 'fast-7b' if it existed). Tune to your loaded set.", "fast": ["nemotron-mini-4b-instruct-mlx", "gemma-4-e4b-it-optiq", "granite-4.1-8b", "qwen3.5-9b-optiq"], "coder": ["qwen/qwen3-coder-next", "coder"], "reasoner": ["qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking", "nousresearch/hermes-4-70b", "openai/gpt-oss-20b", "granite-4.1-30b"], "vision": ["vl", "vision", "llava"], "default": ["granite-4.1-8b", "qwen3.5-9b-optiq"]}, "default_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "max_parallel": 1, "max_concurrent_models": 1, "anthropic_available": false, "anthropic_model": null, "swarm_chat_enabled": true, "swarm_chat_default_models": ["role:reasoner", "role:coder", "role:fast"], "swarm_chat_default_strategy": "best-of-n"}

@@ -1,0 +1,9 @@
+=== dashboard preferences POST ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:33:37 GMT
+Content-Type: application/json
+Content-Length: 183
+Connection: close
+
+{"ok": true, "preferences": {"default_model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "swarm_presets": {"baseline": ["mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx"]}}}

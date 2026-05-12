@@ -1,0 +1,12 @@
+=== capabilities header (latency tier) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:33:50 GMT
+X-Model-Routed-To: mlx/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx
+X-MLX-Latency-Ms: 812
+X-MLX-Queue-Wait-Ms: 0
+Content-Type: application/json
+Content-Length: 350
+Connection: close
+
+{"id": "chatcmpl_435b5be9a8eb49409eb7b34dc64cbc37", "object": "chat.completion", "created": 1778592830, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "I'm sorry"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 15, "completion_tokens": 4, "total_tokens": 19}}

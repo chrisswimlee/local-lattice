@@ -1,0 +1,9 @@
+=== DELETE model unload ===
+HTTP/1.1 404 NOT FOUND
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:33:37 GMT
+Content-Type: application/json
+Content-Length: 169
+Connection: close
+
+{"ok": false, "error": "Model 'mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx' is not currently loaded.", "resident": ["lmstudio-community/Qwen3-Coder-Next-MLX-8bit"]}

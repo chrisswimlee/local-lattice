@@ -1,0 +1,10 @@
+=== /swarm/fanout (models param) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:34:45 GMT
+X-Swarm-Models: mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx
+Content-Type: application/json
+Content-Length: 639
+Connection: close
+
+{"id": "swarm_748c040091e84264ad6345c47ccad55a", "object": "swarm.fanout", "created": 1778592885, "responses": [{"model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "ok": true, "error": null, "latency_ms": 1658, "response": {"id": "chatcmpl_300d193345ab4d2d9e2a40b7d621cb45", "object": "chat.completion", "created": 1778592885, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "A"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 15, "completion_tokens": 1, "total_tokens": 16}, "_meta": {"latency_ms": 463, "backend": "mlx"}}, "text": "A"}]}

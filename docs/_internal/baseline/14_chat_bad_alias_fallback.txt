@@ -1,0 +1,13 @@
+=== bad alias (fallback) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:32:04 GMT
+X-Model-Routed-To: mlx/mlx-community/Qwen3.6-27B-8bit
+X-MLX-Latency-Ms: 4116
+X-MLX-Queue-Wait-Ms: 0
+X-Model-Resolution: fallback (requested 'gpt-9000-imaginary', not present)
+Content-Type: application/json
+Content-Length: 340
+Connection: close
+
+{"id": "chatcmpl_01acb4488b604a789f555de3099cbea4", "object": "chat.completion", "created": 1778592724, "model": "mlx-community/Qwen3.6-27B-8bit", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Here's a thinking"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}}

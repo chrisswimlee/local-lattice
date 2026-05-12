@@ -1,0 +1,11 @@
+=== /swarm/vote (first-success) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:34:45 GMT
+X-Swarm-Strategy: first-success
+X-Swarm-Winner: mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx
+Content-Type: application/json
+Content-Length: 975
+Connection: close
+
+{"id": "chatcmpl_cd573a4b6d6d46639f4424267ecb9c9d", "object": "chat.completion", "created": 1778592885, "model": "swarm/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "B"}, "finish_reason": "stop"}], "swarm": {"strategy": "first-success", "winner": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "rationale": "first agent to return a non-empty response", "candidates": [{"model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "ok": true, "error": null, "latency_ms": 147, "response": {"id": "chatcmpl_1f12c93cd4db4c2ebfac9bfbb2400de0", "object": "chat.completion", "created": 1778592885, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "B"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 15, "completion_tokens": 1, "total_tokens": 16}, "_meta": {"latency_ms": 147, "backend": "mlx"}}, "text": "B"}]}}

@@ -1,0 +1,22 @@
+=== /v1/chat/completions streaming ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:31:47 GMT
+X-Model-Routed-To: mlx/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx
+X-MLX-Queue-Wait-Ms: 0
+Content-Type: text/event-stream; charset=utf-8
+Transfer-Encoding: chunked
+Connection: close
+
+data: {"id": "chatcmpl_78b54065bacc43078f219f82b1ea464a", "object": "chat.completion.chunk", "created": 1778592707, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl_78b54065bacc43078f219f82b1ea464a", "object": "chat.completion.chunk", "created": 1778592707, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl_78b54065bacc43078f219f82b1ea464a", "object": "chat.completion.chunk", "created": 1778592707, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "delta": {"content": " World"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl_78b54065bacc43078f219f82b1ea464a", "object": "chat.completion.chunk", "created": 1778592707, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "delta": {"content": "!"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl_78b54065bacc43078f219f82b1ea464a", "object": "chat.completion.chunk", "created": 1778592707, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+
+data: [DONE]
+

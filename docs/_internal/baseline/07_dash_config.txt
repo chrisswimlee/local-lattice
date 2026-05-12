@@ -1,0 +1,60 @@
+=== /dashboard/api/config ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:31:13 GMT
+Content-Type: application/json
+Content-Length: 1469
+Connection: close
+
+{
+  "dashboard_enabled": true,
+  "preview_chars": 200,
+  "max_events": 200,
+  "capture_prompts": false,
+  "max_prompt_chars": 8000,
+  "note": "Chain-of-thought is not exposed.",
+  "model_roles": {
+    "_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing model wins. Exact ids beat substrings (substring 'fast' would also match e.g. 'fast-7b' if it existed). Tune to your loaded set.",
+    "fast": [
+      "nemotron-mini-4b-instruct-mlx",
+      "gemma-4-e4b-it-optiq",
+      "granite-4.1-8b",
+      "qwen3.5-9b-optiq"
+    ],
+    "coder": [
+      "qwen/qwen3-coder-next",
+      "coder"
+    ],
+    "reasoner": [
+      "qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking",
+      "nousresearch/hermes-4-70b",
+      "openai/gpt-oss-20b",
+      "granite-4.1-30b"
+    ],
+    "vision": [
+      "vl",
+      "vision",
+      "llava"
+    ],
+    "default": [
+      "granite-4.1-8b",
+      "qwen3.5-9b-optiq"
+    ]
+  },
+  "default_model_env": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx",
+  "max_concurrent_models": 1,
+  "max_parallel_model_calls": 1,
+  "swarm_fanout_timeout_sec": null,
+  "swarm_fanout_budget_example_sec": 540.0,
+  "anthropic_enabled": false,
+  "admission": {
+    "enabled": true,
+    "inflight_cap_per_model": 1,
+    "queue_max_per_model": 32,
+    "queue_max_total": 128,
+    "inflight_total": 0,
+    "queued_total": 0,
+    "inflight_by_alias": {},
+    "queued_by_alias": {}
+  }
+}

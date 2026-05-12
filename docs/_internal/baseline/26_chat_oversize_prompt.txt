@@ -1,0 +1,12 @@
+=== huge prompt error/trim ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:34:53 GMT
+X-Model-Routed-To: mlx/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx
+X-MLX-Latency-Ms: 7114
+X-MLX-Queue-Wait-Ms: 0
+Content-Type: application/json
+Content-Length: 354
+Connection: close
+
+{"id": "chatcmpl_4779d4a0a0f342c989dd17a32b46b696", "object": "chat.completion", "created": 1778592893, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "p p p p"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 30011, "completion_tokens": 4, "total_tokens": 30015}}

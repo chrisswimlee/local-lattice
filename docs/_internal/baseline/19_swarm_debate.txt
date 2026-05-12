@@ -1,0 +1,11 @@
+=== /swarm/debate (1 round, judge=alias, models = same) ===
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.14.4
+Date: Tue, 12 May 2026 13:34:45 GMT
+X-Swarm-Strategy: debate
+X-Swarm-Rounds: 1
+Content-Type: application/json
+Content-Length: 729
+Connection: close
+
+{"id": "chatcmpl_704d293e4e3241b7a7dfc64b655dad9b", "object": "chat.completion", "created": 1778592885, "model": "swarm/debate/mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Based on the information provided,"}, "finish_reason": "stop"}], "swarm": {"strategy": "debate", "rounds": 1, "judge": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "rationale": "synthesized by mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "transcript": [{"round": 1, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "text": "D", "latency_ms": 137}, {"round": 1, "model": "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx", "text": "D", "latency_ms": 125}]}}
