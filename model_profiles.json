@@ -1,0 +1,85 @@
+{
+  "defaults": {
+    "context_window": 128000,
+    "default_max_tokens": 512,
+    "max_tokens_ceiling": 16384,
+    "temperature_default": 0.7,
+    "top_p_default": 0.95,
+    "supports_vision": false,
+    "supports_tools": true,
+    "supports_json_mode": false,
+    "latency_tier": "medium",
+    "memory_gb_estimate": 8.0
+  },
+  "aliases": {
+    "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-4bit": {
+      "context_window": 128000,
+      "max_tokens_ceiling": 16384,
+      "latency_tier": "slow",
+      "memory_gb_estimate": 64.0
+    }
+  },
+  "patterns": [
+    {
+      "substring": "vl",
+      "profile": {
+        "supports_vision": true,
+        "context_window": 128000,
+        "latency_tier": "slow"
+      }
+    },
+    {
+      "substring": "vision",
+      "profile": {
+        "supports_vision": true,
+        "latency_tier": "slow"
+      }
+    },
+    {
+      "substring": "llava",
+      "profile": {
+        "supports_vision": true,
+        "latency_tier": "slow"
+      }
+    },
+    {
+      "substring": "72b",
+      "profile": {
+        "context_window": 128000,
+        "max_tokens_ceiling": 16384,
+        "latency_tier": "slow",
+        "memory_gb_estimate": 48.0
+      }
+    },
+    {
+      "substring": "70b",
+      "profile": {
+        "context_window": 128000,
+        "max_tokens_ceiling": 16384,
+        "latency_tier": "slow",
+        "memory_gb_estimate": 40.0
+      }
+    },
+    {
+      "substring": "8b",
+      "profile": {
+        "latency_tier": "fast",
+        "memory_gb_estimate": 6.0
+      }
+    },
+    {
+      "substring": "7b",
+      "profile": {
+        "latency_tier": "fast",
+        "memory_gb_estimate": 5.0
+      }
+    },
+    {
+      "substring": "3b",
+      "profile": {
+        "latency_tier": "fast",
+        "memory_gb_estimate": 3.0
+      }
+    }
+  ]
+}

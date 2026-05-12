@@ -1,0 +1,6 @@
+# Python deps for middle_layerMLX.py (use inside a venv — see run_with_venv.sh)
+mlx-lm
+flask
+requests
+huggingface_hub
+litellm

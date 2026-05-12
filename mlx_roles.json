@@ -1,0 +1,33 @@
+{
+  "_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing model wins. Exact ids beat substrings (substring 'fast' would also match e.g. 'fast-7b' if it existed). Tune to your loaded set.",
+
+  "fast": [
+    "nemotron-mini-4b-instruct-mlx",
+    "gemma-4-e4b-it-optiq",
+    "granite-4.1-8b",
+    "qwen3.5-9b-optiq"
+  ],
+
+  "coder": [
+    "qwen/qwen3-coder-next",
+    "coder"
+  ],
+
+  "reasoner": [
+    "qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking",
+    "nousresearch/hermes-4-70b",
+    "openai/gpt-oss-20b",
+    "granite-4.1-30b"
+  ],
+
+  "vision": [
+    "vl",
+    "vision",
+    "llava"
+  ],
+
+  "default": [
+    "granite-4.1-8b",
+    "qwen3.5-9b-optiq"
+  ]
+}

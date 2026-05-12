@@ -1,0 +1,38 @@
+def resolve_model_id(requested_model: str | None):
+    """
+    Decide which LM Studio model ID to use for this request.
+    Returns (model_id, error_message).
+    """
+-    model_ids, err = get_lmstudio_model_ids()
++    model_ids, err = get_lmstudio_model_ids()
+     if err:
+         return None, err
+     if not model_ids:
+         return None, "No model is loaded in LM Studio."
+ 
+-    requested = (requested_model or "").strip()
++    # Support comma‑separated list of model ids
++    if isinstance(requested_model, str) and "," in requested_model:
++        candidates = [m.strip() for m in requested_model.split(",") if m.strip()]
++    else:
++        candidates = [requested_model] if requested_model is not None else []
+ 
+-    # Respect explicit valid models.
+-    if requested and requested not in PLACEHOLDER_MODELS:
+-        if requested in model_ids:
+-            return requested, None
+-        return None, f"Requested model '{requested}' is not available in LM Studio. Available: {model_ids}"
++    # Respect explicit valid models.
++    for cand in candidates:
++        if not cand or cand in PLACEHOLDER_MODELS:
++            continue
++        if cand in model_ids:
++            return cand, None
++    # If none matched and we have candidates, error
++    if candidates:
++        return None, f"Requested model(s) '{requested_model}' not available in LM Studio. Available: {model_ids}"
+ 
+     # Placeholder/missing: use DEFAULT_MODEL/TARGET_MODEL if it matches.
+     if isinstance(DEFAULT_MODEL, str) and DEFAULT_MODEL.strip():
+         preferred = DEFAULT_MODEL.strip()
+*** End Patch

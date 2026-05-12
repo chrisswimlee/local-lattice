@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>middle_layerMLX</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; background: #111; color: #e8e8e8; }
+    body { margin: 0; padding: 1rem 1.25rem 2rem; max-width: 1200px; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
+    .sub { color: #888; font-size: 0.85rem; margin-bottom: 1.25rem; }
+    section { margin-bottom: 1.5rem; }
+    h2 { font-size: 0.95rem; margin: 0 0 0.5rem; color: #ccc; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #333; vertical-align: top; }
+    th { color: #999; font-weight: 500; }
+    .pill { display: inline-block; padding: 0.15rem 0.45rem; border-radius: 4px; background: #2a2a2a; font-size: 0.75rem; }
+    .err { color: #f66; }
+    .ok { color: #8c8; }
+    label { display: block; font-size: 0.75rem; color: #888; margin-top: 0.5rem; }
+    input, textarea, button { font: inherit; padding: 0.35rem 0.5rem; border-radius: 4px; border: 1px solid #444; background: #1a1a1a; color: #eee; }
+    button { cursor: pointer; margin-top: 0.5rem; }
+    textarea { width: 100%; min-height: 4rem; box-sizing: border-box; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; }
+    .row > div { flex: 1; min-width: 140px; }
+    #status { font-size: 0.8rem; margin-bottom: 1rem; }
+    code { font-size: 0.78rem; color: #aad; }
+  </style>
+</head>
+<body>
+  <h1>middle_layerMLX</h1>
+  <p class="sub">Routing and throughput only. This view does not expose model chain-of-thought.</p>
+  <div id="status">Loading…</div>
+
+  <section>
+    <h2>API key</h2>
+    <p class="sub">If <code>MIDDLE_LAYER_API_KEY</code> is set, enter it here (stored in <code>sessionStorage</code>).</p>
+    <div class="row">
+      <div>
+        <label for="apiKey">X-API-Key</label>
+        <input type="password" id="apiKey" autocomplete="off" placeholder="optional" />
+      </div>
+      <div>
+        <button type="button" id="saveKey">Save key</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Models</h2>
+    <div id="models"></div>
+    <div class="row">
+      <div>
+        <label for="loadAlias">Load model alias</label>
+        <input type="text" id="loadAlias" placeholder="publisher/model-id" />
+      </div>
+      <div>
+        <button type="button" id="btnLoad">Load</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Runtime default (placeholder requests)</h2>
+    <div class="row">
+      <div>
+        <label for="defModel">Default MLX alias (empty clears)</label>
+        <input type="text" id="defModel" placeholder="optional override" />
+      </div>
+      <div>
+        <button type="button" id="btnPrefs">Save preferences</button>
+      </div>
+    </div>
+    <label for="presetsJson">Swarm presets (JSON object: name → array of model specs)</label>
+    <textarea id="presetsJson" placeholder='{"myTeam":["role:coder","role:fast"]}'></textarea>
+  </section>
+
+  <section>
+    <h2>Active &amp; recent</h2>
+    <div id="active"></div>
+    <div id="events"></div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>
