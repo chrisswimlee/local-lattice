@@ -2,12 +2,10 @@ import os
 import sys
 import json
 import time
-import threading
 import warnings
 import requests
 import re
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, Response, stream_with_context
 
 from middle_layer.security import apply_security_headers as _apply_security_headers
@@ -202,7 +200,6 @@ from middle_layer.swarm import (  # noqa: E402
     SWARM_STREAM_CHUNK_CHARS,
     _per_model_semaphore,
     _per_model_semaphores,
-    _per_model_semaphores_lock,
 )
 
 
@@ -1113,9 +1110,11 @@ def _call_anthropic_chat(messages, model_override=None, **kwargs):
         return None, f"Anthropic error: {e}"
 
 
-from middle_layer.swarm import (  # noqa: E402
-    _CRASH_PHRASES,
-    _OOM_PHRASES,
+# Pure swarm helpers re-exported here so historical call sites (and tests
+# that monkey-patch ``mod._classify_swarm_error`` etc.) keep working without
+# updating to the new module path. New code should import from
+# ``middle_layer.swarm`` directly.
+from middle_layer.swarm import (  # noqa: E402, F401
     _SWARM_ERROR_KINDS,
     _classify_swarm_error,
     _extract_text,
@@ -1145,140 +1144,6 @@ def _expand_swarm_models(spec, available=None):
     )
 
 
-def _run_one_agent(spec, default_messages, default_kwargs, available, loaded=None):
-    """Run one agent. Returns (resolved_model_id_or_label, response, error, latency_ms)."""
-    spec = _normalize_agent_spec(spec)
-    requested = spec.get("model")
-    requested_str = (requested or "").strip()
-
-    msgs = spec.get("messages") or list(default_messages)
-    sys_prompt = spec.get("system")
-    if sys_prompt:
-        msgs = [{"role": "system", "content": sys_prompt}] + [
-            m for m in msgs if isinstance(m, dict) and m.get("role") != "system"
-        ]
-
-    kwargs = dict(default_kwargs)
-    for k in ("max_tokens", "temperature", "top_p", "timeout"):
-        if k in spec and spec[k] is not None:
-            kwargs[k] = spec[k]
-
-    # Anthropic participant.
-    if requested_str.lower().startswith("anthropic"):
-        override = None
-        if ":" in requested_str:
-            override = requested_str.split(":", 1)[1].strip() or None
-        label = f"anthropic/{override or ANTHROPIC_MODEL}"
-        t0 = time.time()
-        resp, err = _call_anthropic_chat(msgs, model_override=override, **kwargs)
-        return label, resp, err, int((time.time() - t0) * 1000)
-
-    # LM Studio participant. Same-model agents serialize through a per-model
-    # semaphore so a 3-way fanout that all resolves to one loaded id doesn't
-    # fire 2-3 concurrent inference jobs at LM Studio (which crashes large
-    # MoE models at high ctx).
-    model_id, err = resolve_model_id(requested, available, loaded=loaded)
-    if err:
-        return requested or "?", None, err, 0
-    sem = _per_model_semaphore(model_id)
-    t0 = time.time()
-    with sem:
-        resp, err = _lmstudio_chat_completion(model_id, msgs, **kwargs)
-    return model_id, resp, err, int((time.time() - t0) * 1000)
-
-
-def _fanout(specs, messages, common_kwargs, max_parallel=None):
-    """Run each spec in parallel (bounded). Returns (results_list, error)."""
-    if not specs:
-        return None, "swarm requires at least one model"
-
-    available, err = get_lmstudio_model_ids()
-    if err:
-        # Anthropic-only swarms can still proceed without LM Studio reachable.
-        all_anthropic = all(
-            isinstance(s, str) and s.lower().startswith("anthropic")
-            or (isinstance(s, dict) and str(s.get("model", "")).lower().startswith("anthropic"))
-            for s in specs
-        )
-        if not all_anthropic:
-            return None, err
-        available = []
-
-    # Probe loaded ids once for the whole fanout so every agent sees the same
-    # snapshot and we don't ask LM Studio 3x in parallel.
-    loaded = None
-    if PREFER_LOADED_MODELS and available:
-        loaded, _lerr = get_loaded_lmstudio_model_ids()
-
-    cap = MAX_PARALLEL_MODEL_CALLS
-    if isinstance(max_parallel, int) and max_parallel > 0:
-        cap = min(cap, max_parallel)
-    results = [None] * len(specs)
-    workers = max(1, min(cap, len(specs)))
-
-    def _spec_to_agent_id(spec) -> str:
-        """Stable, caller-visible label for the agent. Preserves the original
-        request shape (role:reasoner, anthropic:claude-..., raw id, glob) so
-        the openclaw runtime can correlate per-candidate results back to the
-        slot it asked for, even if resolution lands on a fallback model.
-        """
-        if isinstance(spec, str):
-            return spec
-        if isinstance(spec, dict):
-            m = spec.get("model")
-            return str(m) if m is not None else "?"
-        return str(spec)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {
-            pool.submit(_run_one_agent, spec, messages, common_kwargs, available, loaded): i
-            for i, spec in enumerate(specs)
-        }
-        for fut in as_completed(futs):
-            i = futs[fut]
-            try:
-                model_id, resp, e, latency = fut.result()
-            except Exception as e:  # noqa: BLE001
-                model_id, resp, latency = "?", None, 0
-                e = str(e)
-            text = _extract_text(resp) if resp else ""
-            api_ok = e is None and resp is not None
-            error_kind = None
-            http_status = None
-            error_detail = None
-            if not api_ok and e:
-                http_status = _extract_upstream_status(e)
-                error_kind = _classify_swarm_error(e, http_status=http_status)
-                error_detail = _strip_upstream_prefix(e)
-            elif api_ok and not text:
-                # 200 OK but the assistant ``content`` is empty. Common with
-                # reasoning models when ``max_tokens`` is consumed entirely by
-                # ``reasoning_content`` (we keep ``response`` on the candidate
-                # so callers can recover the chain-of-thought if they want).
-                error_kind = "empty_response"
-                error_detail = (
-                    "upstream returned 200 with empty assistant content "
-                    "(check reasoning_content / increase max_tokens)"
-                )
-                e = "empty assistant content"
-            # Swarm logic treats "no usable text" as a fail (it can't vote on
-            # nothing), so collapse api_ok + empty text into ok=False here.
-            ok = api_ok and bool(text)
-            results[i] = {
-                "agent_id": _spec_to_agent_id(specs[i]),
-                "model": model_id,
-                "ok": ok,
-                "error": e,
-                "error_kind": error_kind,
-                "http_status": http_status,
-                "error_detail": error_detail,
-                "latency_ms": latency,
-                "response": resp,
-                "text": text,
-            }
-    return results, None
-
-
 from middle_layer.swarm import (  # noqa: E402
     _SWARM_CHAT_CANONICAL,
     _SWARM_CHAT_INTENTS,
@@ -1287,244 +1152,70 @@ from middle_layer.swarm import (  # noqa: E402
     _swarm_alias_warned,
     _swarm_chat_intent,
 )
+from middle_layer import swarm as _swarm_runner  # noqa: E402
+
+# Single ``SwarmDeps`` for this gateway. Built lazily so module-level globals
+# defined further down (``ANTHROPIC_MODEL``, etc.) are already in scope.
+_SWARM_DEPS: _swarm_runner.SwarmDeps | None = None
+
+
+def _swarm_deps() -> _swarm_runner.SwarmDeps:
+    """Lazily-built dependency bundle for the gateway-agnostic swarm runners.
+    Cached after first call so repeat dispatches don't re-allocate.
+    """
+    global _SWARM_DEPS
+    if _SWARM_DEPS is None:
+        _SWARM_DEPS = _swarm_runner.SwarmDeps(
+            chat_completion=_lmstudio_chat_completion,
+            anthropic_chat=_call_anthropic_chat,
+            resolve_model_id=resolve_model_id,
+            get_available_models=get_lmstudio_model_ids,
+            get_loaded_models=get_loaded_lmstudio_model_ids,
+            extract_user_intent=_extract_user_intent_text,
+            anthropic_default_model=ANTHROPIC_MODEL,
+            prefer_loaded_models=PREFER_LOADED_MODELS,
+        )
+    return _SWARM_DEPS
+
+
+def _run_one_agent(spec, default_messages, default_kwargs, available, loaded=None):
+    """Back-compat thin wrapper around ``swarm.run_one_agent``. New code
+    should call ``swarm.run_one_agent`` directly with a SwarmDeps."""
+    return _swarm_runner.run_one_agent(
+        spec, default_messages, default_kwargs, available, _swarm_deps(), loaded=loaded
+    )
+
+
+def _fanout(specs, messages, common_kwargs, max_parallel=None):
+    """Back-compat thin wrapper around ``swarm.fanout``."""
+    return _swarm_runner.fanout(
+        specs, messages, common_kwargs, _swarm_deps(), max_parallel=max_parallel
+    )
 
 
 def _run_swarm_chat_completion(requested_model: str, json_data: dict, intent: str = "council"):
-    """Execute swarm logic and return ``(body, err_str, err_details)``.
-
-    ``intent`` (from ``_swarm_chat_intent``) selects the implicit strategy
-    when the request body omits ``swarm.strategy``:
-
-      ``council``  -> ``SWARM_CHAT_DEFAULT_STRATEGY`` (best-of-n with judge)
-      ``fanout``   -> ``"fanout"`` (no judge; return first successful)
-      ``pipeline`` -> immediate 400 redirecting to POST /swarm/pipeline
-                      because OpenAI chat shape can't carry ``stages[]``.
-
-    ``err_details`` is non-None only on the *all-agents-failed* branch; the
-    HTTP route handler surfaces it as ``error_details`` in the JSON 502 body
-    so clients can dispatch on ``error_kind`` instead of parsing the prose
-    summary. Pre-fanout validation failures still return the legacy
-    ``(None, err_str, None)`` shape — there's no per-agent breakdown yet.
-    """
-    if intent == "pipeline":
-        # Pipeline genuinely needs ``stages[]`` (per-step model + prompt
-        # template). The OpenAI chat shape only carries ``messages[]``, so
-        # silently routing to best-of-n would be a worse lie than rejecting.
-        return None, (
-            "swarm/pipeline cannot run on /v1/chat/completions because the "
-            "OpenAI chat shape cannot carry 'stages[]'. Send your request to "
-            "POST /swarm/pipeline (with {stages: [{model, prompt_prefix}, ...], "
-            "input}) instead."
-        ), None
-
-    messages = json_data.get("messages") or []
-    if not isinstance(messages, list) or not messages:
-        return None, "messages (list) is required for swarm chat", None
-
-    common = {k: json_data.get(k) for k in ("max_tokens", "temperature", "top_p")}
-    common = {k: v for k, v in common.items() if v is not None}
-
-    swarm_cfg = json_data.get("swarm") if isinstance(json_data.get("swarm"), dict) else {}
-    models = swarm_cfg.get("models") or SWARM_CHAT_DEFAULT_MODELS
-    # Intent-aware default strategy: ``swarm/fanout`` defaults to no-judge
-    # fanout regardless of SWARM_CHAT_DEFAULT_STRATEGY. Explicit
-    # swarm.strategy in the body still wins (caller is the source of truth).
-    if swarm_cfg.get("strategy"):
-        strategy = swarm_cfg["strategy"].lower()
-    elif intent == "fanout":
-        strategy = "fanout"
-    else:
-        strategy = SWARM_CHAT_DEFAULT_STRATEGY.lower()
-    max_parallel = swarm_cfg.get("max_parallel")
-
-    if not isinstance(models, (list, str)) or not models:
-        return None, "swarm.models must be a non-empty list (or 'auto')", None
-
-    models, exp_err = _expand_swarm_models(models)
-    if exp_err:
-        return None, exp_err, None
-    if not models:
-        return None, (
-            "swarm.models expanded to an empty set: no models are loaded in "
-            "LM Studio. Load at least one model (or pass an explicit swarm.models)."
-        ), None
-
-    candidates, err = _fanout(models, messages, common, max_parallel=max_parallel)
-    if err:
-        return None, err, None
-
-    successes = [c for c in candidates if c["ok"] and c.get("text")]
-    if not successes:
-        errs = "; ".join(c.get("error") or "unknown" for c in candidates)
-        return (
-            None,
-            f"all swarm agents failed: {errs}",
-            _summarize_failed_candidates(candidates),
-        )
-
-    winner = None
-    rationale = ""
-
-    if strategy in ("fanout",):
-        winner = successes[0]
-        rationale = "fanout completed; returning first successful response"
-    elif strategy in ("first-success", "first_success"):
-        winner = successes[0]
-        rationale = "first agent to return a non-empty response"
-    elif strategy == "longest":
-        winner = max(successes, key=lambda c: len(c.get("text", "")))
-        rationale = "longest non-empty response"
-    elif len(successes) == 1:
-        # best-of-n with a single survivor has nothing to compare; skip the
-        # judge call entirely. Avoids spending a 200-token judge round on a
-        # foregone conclusion AND prevents a busy judge model (e.g. another
-        # caller hammering qwen3.5-122b-a10b) from blocking the response.
-        winner = successes[0]
-        rationale = "single successful candidate; judge skipped"
-    else:
-        labels = [chr(ord("A") + i) for i in range(len(successes))]
-        rendered = "\n\n".join(
-            f"[{labels[i]}] (model={successes[i]['model']})\n{successes[i]['text']}"
-            for i in range(len(successes))
-        )
-        original_user = _extract_user_intent_text({"messages": messages})
-        judge_system = swarm_cfg.get("judge_system") or (
-            "You are a strict judge. Below are candidate responses to a user request "
-            "from different models, labeled [A], [B], etc. Pick the single best one. "
-            "Reply with ONLY the letter on its own line, then a one-sentence reason."
-        )
-        judge_messages = [
-            {"role": "system", "content": judge_system},
-            {"role": "user", "content": (
-                f"Original request:\n{original_user}\n\n"
-                f"Candidate responses:\n{rendered}\n\n"
-                "Pick the best one (A, B, ...) and explain briefly."
-            )},
-        ]
-        judge_request = swarm_cfg.get("judge") or SWARM_CHAT_DEFAULT_JUDGE
-        avail, _ = get_lmstudio_model_ids()
-        judge_id, jerr = resolve_model_id(judge_request, avail)
-
-        if jerr or not judge_id:
-            winner = max(successes, key=lambda c: len(c.get("text", "")))
-            rationale = f"judge unavailable ({jerr or 'no model'}); picked longest"
-        else:
-            # Route the judge call through the same per-model semaphore the
-            # agents use, so a busy judge model can't open a second concurrent
-            # inference job against an already-loaded MoE (which crashes LM
-            # Studio under high context — see LM_STUDIO_PER_MODEL_INFLIGHT_CAP).
-            with _per_model_semaphore(judge_id):
-                jresp, jerr = _lmstudio_chat_completion(
-                    judge_id, judge_messages, max_tokens=200, temperature=0.0
-                )
-            verdict = _extract_text(jresp)
-            picked_idx = None
-            if verdict:
-                for i, lab in enumerate(labels):
-                    if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                        picked_idx = i
-                        break
-            if picked_idx is None:
-                winner = max(successes, key=lambda c: len(c.get("text", "")))
-                rationale = (
-                    f"judge response unparseable; fell back to longest. "
-                    f"Verdict: {verdict[:140]}"
-                )
-            else:
-                winner = successes[picked_idx]
-                rationale = verdict.strip()
-
-    out = {
-        "id": f"chatcmpl_{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": f"swarm/{winner['model']}",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": winner["text"]},
-            "finish_reason": "stop",
-        }],
-        "swarm": {
-            "strategy": strategy,
-            "winner": winner["model"],
-            "rationale": rationale,
-            "candidates": candidates,
-            "requested_model": requested_model,
-        },
-    }
-    return out, None, None
+    """Back-compat thin wrapper around ``swarm.run_swarm_chat_completion``."""
+    return _swarm_runner.run_swarm_chat_completion(
+        requested_model, json_data, _swarm_deps(), intent=intent
+    )
 
 
 def _swarm_body_to_sse_response(body: dict, *, chunk_chars: int = SWARM_STREAM_CHUNK_CHARS):
-    """Wrap a non-stream swarm chat.completion as OpenAI SSE chunks.
-
-    Swarm vote/fanout/pipeline are inherently batch (every candidate has to
-    finish before the judge votes), so streaming clients get the winner's text
-    sliced back into ``chat.completion.chunk`` deltas. Trailing ``data: [DONE]``
-    is always emitted so well-behaved consumers don't hang.
+    """Wrap the gateway-agnostic SSE generator in a Flask ``Response`` so
+    streaming-only clients can consume swarm chat completions. Headers
+    (``X-Model-Routed-To`` / ``X-Swarm-Strategy`` / ``X-Swarm-Winner``)
+    come from ``swarm.swarm_response_headers``; we add transport headers
+    (``Cache-Control``, ``X-Accel-Buffering``) here.
     """
-    response_id = body.get("id") or f"chatcmpl_{uuid.uuid4().hex}"
-    created = int(body.get("created") or time.time())
-    model = body.get("model") or "swarm/unknown"
-
-    text = ""
-    choices = body.get("choices") or []
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        msg = choices[0].get("message") or {}
-        if isinstance(msg, dict):
-            text = str(msg.get("content") or "")
-
-    swarm_meta = body.get("swarm") if isinstance(body.get("swarm"), dict) else None
-
-    def _gen():
-        first = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(first)}\n\n"
-
-        step = max(1, int(chunk_chars))
-        if text:
-            for i in range(0, len(text), step):
-                piece = text[i : i + step]
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {"index": 0, "delta": {"content": piece}, "finish_reason": None}
-                    ],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-
-        final = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
-        if swarm_meta is not None:
-            final["swarm"] = swarm_meta
-        yield f"data: {json.dumps(final)}\n\n"
-        yield "data: [DONE]\n\n"
-
     headers = {
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
-        "X-Model-Routed-To": str(model),
+        **_swarm_runner.swarm_response_headers(body),
     }
-    if isinstance(swarm_meta, dict):
-        if swarm_meta.get("strategy"):
-            headers["X-Swarm-Strategy"] = str(swarm_meta["strategy"])
-        if swarm_meta.get("winner"):
-            headers["X-Swarm-Winner"] = str(swarm_meta["winner"])
     return Response(
-        stream_with_context(_gen()),
+        stream_with_context(
+            _swarm_runner.stream_swarm_body_as_sse(body, chunk_chars=chunk_chars)
+        ),
         status=200,
         mimetype="text/event-stream",
         headers=headers,

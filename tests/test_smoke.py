@@ -380,11 +380,24 @@ def test_run_swarm_chat_completion_fanout_intent_defaults_strategy() -> None:
             },
         ], None
 
-    saved = mod._fanout
-    saved_default_models = mod.SWARM_CHAT_DEFAULT_MODELS
+    # The IO runners now live in middle_layer.swarm; patch there so the
+    # gateway's thin _fanout wrapper still hits our fake. This is a deliberate
+    # ergonomic shift — Pass-3 split swarm IO into a shared module so MLX can
+    # reuse it. ``_swarm_runner`` is the in-tree alias for that module.
+    runner = mod._swarm_runner
+    saved_fanout = runner.fanout
+    saved_swarm_default = runner.SWARM_CHAT_DEFAULT_MODELS
+    saved_mod_default = mod.SWARM_CHAT_DEFAULT_MODELS
+
+    def fake_fanout_with_deps(specs, messages, common, deps, max_parallel=None):
+        # Adapter: swarm.run_swarm_chat_completion calls swarm.fanout with a
+        # ``deps`` positional, but the legacy fake_fanout signature doesn't
+        # take it. Drop it and forward.
+        return fake_fanout(specs, messages, common, max_parallel=max_parallel)
+
     try:
-        mod._fanout = fake_fanout
-        # Make sure default has 2 entries so we get 2 candidates.
+        runner.fanout = fake_fanout_with_deps
+        runner.SWARM_CHAT_DEFAULT_MODELS = ["fake-a", "fake-b"]
         mod.SWARM_CHAT_DEFAULT_MODELS = ["fake-a", "fake-b"]
         body, err, details = mod._run_swarm_chat_completion(
             "swarm/fanout",
@@ -397,8 +410,9 @@ def test_run_swarm_chat_completion_fanout_intent_defaults_strategy() -> None:
         assert body["swarm"]["winner"] == "fake-a"
         assert body["swarm"]["rationale"].startswith("fanout")
     finally:
-        mod._fanout = saved
-        mod.SWARM_CHAT_DEFAULT_MODELS = saved_default_models
+        runner.fanout = saved_fanout
+        runner.SWARM_CHAT_DEFAULT_MODELS = saved_swarm_default
+        mod.SWARM_CHAT_DEFAULT_MODELS = saved_mod_default
 
 
 # ---------------------------------------------------------------------------
