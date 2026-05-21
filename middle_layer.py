@@ -1,6 +1,8 @@
 import os
+import sys
 import json
 import time
+import threading
 import warnings
 import requests
 import re
@@ -8,7 +10,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, Response, stream_with_context
 
+from middle_layer.security import apply_security_headers as _apply_security_headers
+from middle_layer.security import check_api_key as _check_api_key
+from middle_layer.security import enforce_safe_bind as _enforce_safe_bind
+from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError
+from middle_layer.security import resolve_max_request_bytes as _resolve_max_request_bytes
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = _resolve_max_request_bytes()
 
 try:
     from litellm import completion as litellm_completion
@@ -53,10 +62,27 @@ CACHE_TTL_SECONDS = 60
 # Multi-model & swarm configuration
 # ---------------------------------------------------------------------------
 
-# Cache of every loaded LM Studio model id (used by the resolver and swarm).
+# Cache of every configured LM Studio model id (used by the resolver and swarm).
 _cached_model_ids = None
 _cached_model_ids_ts = 0
+# Separate cache of currently-loaded ids (state=loaded via /api/v0/models). Empty
+# list means "queried successfully and nothing is loaded"; None means "not yet
+# probed, or last probe errored". A short TTL is fine — operators load/unload
+# models slowly compared to RPS.
+_cached_loaded_ids = None
+_cached_loaded_ids_ts = 0
+_loaded_endpoint_supported = True
 MODEL_LIST_TTL = int(os.environ.get("MODEL_LIST_TTL", "30"))
+
+# Prefer LM Studio model ids that are already loaded over not-loaded ones. When
+# this is on (default), role lookups iterate preferences against loaded ids
+# first and only fall back to the full installed set if nothing loaded matches.
+# Stops swarm fanouts from JIT-loading three different giant models in parallel
+# on a memory-tight Mac. Set PREFER_LOADED_MODELS=0 to restore the old behavior
+# (treat every installed id as equally available).
+PREFER_LOADED_MODELS = os.environ.get("PREFER_LOADED_MODELS", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 # Tokens that mean "you pick a model for me". OpenClaw-specific ids are gated
 # behind EXTRA_PLACEHOLDER_MODELS (see middle_layerMLX.py for the shared policy).
@@ -114,28 +140,78 @@ DEFAULT_MODEL_ROLES = {
 }
 
 
+def _autodiscover_roles_file():
+    """Look for lmstudio_roles.json (preferred) or mlx_roles.json next to this
+    script and one directory up, so users running ``python middle_layer.py``
+    directly still get a tuned role registry without needing to set
+    ``MODEL_ROLES_FILE``. Returns the absolute path or None.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "lmstudio_roles.json"),
+        os.path.join(os.path.dirname(here), "lmstudio_roles.json"),
+        os.path.join(here, "mlx_roles.json"),
+        os.path.join(os.path.dirname(here), "mlx_roles.json"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def _load_model_roles():
     raw = os.environ.get("MODEL_ROLES_JSON")
     if raw:
         try:
-            return json.loads(raw)
+            return json.loads(raw), "MODEL_ROLES_JSON"
         except Exception as e:
             print(f"WARN: MODEL_ROLES_JSON is not valid JSON: {e}")
     path = os.environ.get("MODEL_ROLES_FILE")
+    source = None
+    if not path:
+        path = _autodiscover_roles_file()
+        if path:
+            source = f"auto:{path}"
+    else:
+        source = f"env:{path}"
     if path and os.path.exists(path):
         try:
             with open(path, "r") as f:
-                return json.load(f)
+                return json.load(f), source
         except Exception as e:
             print(f"WARN: cannot load MODEL_ROLES_FILE={path}: {e}")
-    return dict(DEFAULT_MODEL_ROLES)
+    return dict(DEFAULT_MODEL_ROLES), "default"
 
 
-MODEL_ROLES = _load_model_roles()
+MODEL_ROLES, MODEL_ROLES_SOURCE = _load_model_roles()
 
 # Swarm concurrency knobs. A typical Mac can run two reasonably-sized models
 # in parallel; one big + one small is the safe default.
 MAX_PARALLEL_MODEL_CALLS = int(os.environ.get("MAX_PARALLEL_MODEL_CALLS", "2"))
+# Maximum simultaneous LM Studio chat-completion requests targeting the *same*
+# resolved model id. LM Studio reliably crashes large-context MoE models when
+# fed two concurrent inference jobs (observed with qwen3.5-122b-a10b at 128k
+# ctx → "The model has crashed without additional information"). We default to
+# 1 so swarm fanouts whose specs all resolve to the same loaded model are
+# serialized into back-to-back calls instead of crashing the runtime. Set
+# higher (e.g. 2) when you know your loaded models tolerate it.
+LM_STUDIO_PER_MODEL_INFLIGHT_CAP = max(
+    1, int(os.environ.get("LM_STUDIO_PER_MODEL_INFLIGHT_CAP", "1"))
+)
+_per_model_semaphores: dict[str, threading.Semaphore] = {}
+_per_model_semaphores_lock = threading.Lock()
+
+
+def _per_model_semaphore(model_id: str) -> threading.Semaphore:
+    """Lazily allocate (and reuse) a per-model semaphore so concurrent swarm
+    agents that resolve to the same id are serialized through LM Studio.
+    """
+    with _per_model_semaphores_lock:
+        sem = _per_model_semaphores.get(model_id)
+        if sem is None:
+            sem = threading.Semaphore(LM_STUDIO_PER_MODEL_INFLIGHT_CAP)
+            _per_model_semaphores[model_id] = sem
+        return sem
 SWARM_PER_CALL_TIMEOUT = int(os.environ.get("SWARM_PER_CALL_TIMEOUT", "180"))
 SWARM_CHAT_ENABLED = os.environ.get("SWARM_CHAT_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
@@ -260,12 +336,82 @@ def get_lmstudio_model_ids(force_refresh: bool = False):
         return [], f"Error discovering models: {str(e)}"
 
 
+def get_loaded_lmstudio_model_ids(force_refresh: bool = False):
+    """Return (loaded_ids, error) using LM Studio's ``/api/v0/models`` endpoint
+    (which exposes per-instance ``state``). Falls back to "" if the endpoint
+    isn't supported (older LM Studio); the caller should then degrade to
+    ``get_lmstudio_model_ids`` and treat all installed ids as candidates.
+
+    A short cache (``MODEL_LIST_TTL``) prevents swarm fanouts from hammering
+    the API. Once we observe that ``/api/v0/models`` 404s or otherwise fails,
+    we stop probing for the rest of the process.
+    """
+    global _cached_loaded_ids, _cached_loaded_ids_ts, _loaded_endpoint_supported
+
+    if not _loaded_endpoint_supported:
+        return [], None
+
+    now = time.time()
+    if (
+        not force_refresh
+        and _cached_loaded_ids is not None
+        and (now - _cached_loaded_ids_ts) < MODEL_LIST_TTL
+    ):
+        return list(_cached_loaded_ids), None
+
+    try:
+        response = requests.get(f"{LM_STUDIO_URL}/api/v0/models", timeout=5)
+    except requests.exceptions.ConnectionError:
+        return [], "Cannot connect to LM Studio. Is it running?"
+    except requests.exceptions.Timeout:
+        return [], "Timeout connecting to LM Studio."
+    except Exception as e:
+        return [], f"Error discovering loaded models: {str(e)}"
+
+    if response.status_code == 404:
+        # Older LM Studio without the /api/v0 surface. Stop probing.
+        _loaded_endpoint_supported = False
+        _cached_loaded_ids = []
+        _cached_loaded_ids_ts = now
+        return [], None
+    if response.status_code != 200:
+        return [], f"LM Studio /api/v0/models returned {response.status_code}"
+
+    try:
+        data = response.json()
+    except Exception as e:
+        return [], f"Error parsing LM Studio /api/v0/models: {e}"
+
+    loaded = []
+    for entry in (data.get("data") or []) if isinstance(data, dict) else []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("state") == "loaded" and entry.get("id"):
+            loaded.append(entry["id"])
+
+    seen = set()
+    deduped = []
+    for mid in loaded:
+        if mid not in seen:
+            seen.add(mid)
+            deduped.append(mid)
+
+    _cached_loaded_ids = deduped
+    _cached_loaded_ids_ts = now
+    return list(deduped), None
+
+
 def get_current_lmstudio_model():
     """
     Backwards-compatible single-model accessor. Returns (model_id, error)
-    where model_id is the first currently loaded LM Studio model.
-    Prefer get_lmstudio_model_ids() / resolve_model_id() for new code.
+    where model_id is the first currently loaded LM Studio model. Prefers a
+    truly-loaded id when ``/api/v0/models`` is reachable; otherwise falls back
+    to the first id in the configured-model list. Prefer
+    ``get_lmstudio_model_ids`` / ``resolve_model_id`` for new code.
     """
+    loaded, lerr = get_loaded_lmstudio_model_ids()
+    if not lerr and loaded:
+        return loaded[0], None
     ids, err = get_lmstudio_model_ids()
     if err:
         return None, err
@@ -297,11 +443,24 @@ def _match_one(needle: str, haystack):
     return None
 
 
-def _resolve_role(role: str, available):
-    """First available model id whose name matches any preference for `role`."""
+def _resolve_role(role: str, available, loaded=None):
+    """First model id matching any preference for ``role``.
+
+    When ``PREFER_LOADED_MODELS`` is on (default) and ``loaded`` is non-empty,
+    every preference is first matched against the loaded subset; only if
+    nothing in the loaded subset matches do we fall back to the full
+    ``available`` set (which on LM Studio includes downloaded-but-not-loaded
+    ids that would JIT-load on first call). This stops swarm fanouts from
+    JIT-loading three different giant models in parallel and OOMing.
+    """
     prefs = MODEL_ROLES.get(role.lower(), [])
     if isinstance(prefs, str):
         prefs = [prefs]
+    if PREFER_LOADED_MODELS and loaded:
+        for p in prefs:
+            m = _match_one(p, loaded)
+            if m:
+                return m
     for p in prefs:
         m = _match_one(p, available)
         if m:
@@ -309,7 +468,7 @@ def _resolve_role(role: str, available):
     return None
 
 
-def resolve_model_id(requested, available=None):
+def resolve_model_id(requested, available=None, loaded=None):
     """
     Decide which loaded LM Studio model id to use for a request.
 
@@ -321,6 +480,12 @@ def resolve_model_id(requested, available=None):
       "*coder*" / "qwen*"                             -> wildcard substring
       mix any of the above in a comma-separated list, e.g. "role:coder,qwen*"
 
+    When ``PREFER_LOADED_MODELS`` is on and LM Studio's ``/api/v0/models``
+    endpoint reports any ``state=loaded`` ids, every match is attempted
+    against the loaded subset first; not-loaded ids are only returned if the
+    loaded subset cannot satisfy the request. The caller can pass
+    ``available`` and ``loaded`` explicitly to avoid re-probing in a hot loop.
+
     Returns (model_id, error_message). On a soft miss (specific name asked but
     not loaded), error is non-None; the caller decides whether to fall back.
     """
@@ -331,22 +496,46 @@ def resolve_model_id(requested, available=None):
     if not available:
         return None, "No model is loaded in LM Studio."
 
+    if loaded is None and PREFER_LOADED_MODELS:
+        loaded, _lerr = get_loaded_lmstudio_model_ids()
+        # _lerr is non-fatal: on probe failure we just proceed against `available`.
+
     if _is_placeholder(requested):
         if DEFAULT_MODEL:
+            if PREFER_LOADED_MODELS and loaded:
+                m = _match_one(DEFAULT_MODEL, loaded)
+                if m:
+                    return m, None
             m = _match_one(DEFAULT_MODEL, available)
             if m:
                 return m, None
-        # Try the "default" role next, then first available.
-        m = _resolve_role("default", available)
+        # Try the "default" role next, then first loaded id, then first available.
+        m = _resolve_role("default", available, loaded=loaded)
         if m:
             return m, None
+        if PREFER_LOADED_MODELS and loaded:
+            return loaded[0], None
         return available[0], None
 
     candidates = [c.strip() for c in str(requested).split(",") if c.strip()]
+    # First pass: loaded-only (if we have a loaded view).
+    if PREFER_LOADED_MODELS and loaded:
+        for cand in candidates:
+            cand_lc = cand.lower()
+            if cand_lc.startswith("role:"):
+                m = _resolve_role(cand_lc.split(":", 1)[1], available, loaded=loaded)
+                if m:
+                    return m, None
+                continue
+            needle = cand.replace("*", "") if "*" in cand else cand
+            m = _match_one(needle, loaded)
+            if m:
+                return m, None
+    # Second pass: full available set (allows JIT-load of installed ids).
     for cand in candidates:
         cand_lc = cand.lower()
         if cand_lc.startswith("role:"):
-            m = _resolve_role(cand_lc.split(":", 1)[1], available)
+            m = _resolve_role(cand_lc.split(":", 1)[1], available, loaded=loaded)
             if m:
                 return m, None
             continue
@@ -567,6 +756,7 @@ def _build_flask_response(upstream_resp: requests.Response):
 def healthz():
     # Basic readiness: can we reach LM Studio and is at least one model loaded?
     ids, err = get_lmstudio_model_ids(force_refresh=True)
+    loaded, lerr = get_loaded_lmstudio_model_ids(force_refresh=True)
     status = 200 if ids and not err else 503
     return Response(
         json.dumps(
@@ -574,10 +764,16 @@ def healthz():
                 "ok": status == 200,
                 "lmstudio_model": ids[0] if ids else None,
                 "lmstudio_models": ids,
+                "lmstudio_loaded_models": loaded,
+                "lmstudio_loaded_endpoint_supported": _loaded_endpoint_supported,
+                "lmstudio_loaded_error": lerr,
                 "lmstudio_error": err,
                 "model_roles": MODEL_ROLES,
+                "model_roles_source": MODEL_ROLES_SOURCE,
+                "prefer_loaded_models": bool(PREFER_LOADED_MODELS),
                 "default_model": DEFAULT_MODEL or None,
                 "max_parallel": MAX_PARALLEL_MODEL_CALLS,
+                "per_model_inflight_cap": LM_STUDIO_PER_MODEL_INFLIGHT_CAP,
                 "on_model_miss": ON_MODEL_MISS,
                 "anthropic_enabled": bool(ANTHROPIC_API_KEY),
                 "anthropic_model": ANTHROPIC_MODEL,
@@ -588,6 +784,12 @@ def healthz():
                 "swarm_chat_enabled": bool(SWARM_CHAT_ENABLED),
                 "swarm_chat_default_models": SWARM_CHAT_DEFAULT_MODELS,
                 "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
+                "swarm_chat_auto_tokens": sorted(_SWARM_AUTO_TOKENS),
+                "swarm_chat_canonical": _SWARM_CHAT_CANONICAL,
+                "swarm_chat_aliases": {
+                    name: {"intent": intent, "deprecated": deprecated}
+                    for name, (intent, deprecated) in sorted(_SWARM_CHAT_INTENTS.items())
+                },
             }
         ),
         status=status,
@@ -598,17 +800,19 @@ def healthz():
 def _auth_guard():
     if not MIDDLE_LAYER_API_KEY:
         return None
-    x_api_key = request.headers.get("X-API-Key")
-    authz = request.headers.get("Authorization", "")
-    bearer = authz[len("Bearer "):] if authz.startswith("Bearer ") else None
+    if _check_api_key(request.headers, MIDDLE_LAYER_API_KEY):
+        return None
+    return Response(
+        json.dumps({"error": "Unauthorized"}),
+        status=401,
+        mimetype="application/json",
+    )
 
-    if x_api_key != MIDDLE_LAYER_API_KEY and bearer != MIDDLE_LAYER_API_KEY:
-        return Response(
-            json.dumps({"error": "Unauthorized"}),
-            status=401,
-            mimetype="application/json",
-        )
-    return None
+
+@app.after_request
+def _security_headers(response):
+    _apply_security_headers(response, path=request.path or "")
+    return response
 
 
 @app.route('/v1/<path:endpoint>', methods=['POST', 'GET'])
@@ -710,26 +914,66 @@ def proxy(endpoint):
                     headers={"X-Model-Routed-To": f"litellm/{routed_model}"},
                 )
 
-            if (
-                endpoint == "chat/completions"
-                and SWARM_CHAT_ENABLED
-                and _is_swarm_chat_model(requested)
-            ):
-                wants_stream = json_data.get("stream") is True
-                swarm_resp, swarm_err = _run_swarm_chat_completion(requested, json_data)
-                if swarm_err or not swarm_resp:
+            swarm_intent, swarm_canonical = (None, None)
+            if endpoint == "chat/completions" and SWARM_CHAT_ENABLED:
+                swarm_intent, swarm_canonical = _swarm_chat_intent(requested)
+
+            if swarm_intent is not None:
+                # ``pipeline`` is intentionally a 400 (not 502) — it's a
+                # client misuse, not an upstream failure.
+                if swarm_intent == "pipeline":
+                    body, err, _ = _run_swarm_chat_completion(
+                        requested, json_data, intent="pipeline"
+                    )
                     return Response(
-                        json.dumps({"error": f"Swarm routing failed: {swarm_err}"}),
+                        json.dumps({
+                            "error": err,
+                            "redirect": "POST /swarm/pipeline",
+                        }),
+                        status=400,
+                        mimetype="application/json",
+                    )
+
+                wants_stream = json_data.get("stream") is True
+                swarm_resp, swarm_err, swarm_err_details = _run_swarm_chat_completion(
+                    requested, json_data, intent=swarm_intent
+                )
+                if swarm_err or not swarm_resp:
+                    body: dict = {"error": f"Swarm routing failed: {swarm_err}"}
+                    if swarm_err_details:
+                        # Structured per-agent breakdown so callers can dispatch
+                        # on error_kind without parsing the prose summary.
+                        body["error_details"] = swarm_err_details
+                    headers: dict = {}
+                    if swarm_canonical and swarm_canonical.lower() != requested.strip().lower():
+                        # Help the client move off a deprecated alias even on
+                        # the failure path.
+                        headers["X-Swarm-Canonical-Name"] = swarm_canonical
+                    if isinstance(swarm_err_details, dict):
+                        kinds = swarm_err_details.get("kinds") or {}
+                        if kinds:
+                            headers["X-Swarm-Error-Kinds"] = ",".join(
+                                f"{k}={v}" for k, v in sorted(kinds.items())
+                            )
+                    return Response(
+                        json.dumps(body),
                         status=502,
                         mimetype="application/json",
+                        headers=headers or None,
                     )
                 if wants_stream:
                     return _swarm_body_to_sse_response(swarm_resp)
+                resp_headers = {
+                    "X-Model-Routed-To": str(swarm_resp.get("model", "swarm/unknown")),
+                    "X-Swarm-Intent": swarm_intent,
+                }
+                if swarm_canonical and swarm_canonical.lower() != requested.strip().lower():
+                    resp_headers["X-Swarm-Canonical-Name"] = swarm_canonical
                 return Response(
                     json.dumps(swarm_resp),
                     status=200,
                     mimetype="application/json",
-                    headers={"X-Model-Routed-To": str(swarm_resp.get("model", "swarm/unknown"))},
+                    headers=resp_headers,
                 )
             
             # Resolve the requested model against what is actually loaded.
@@ -906,6 +1150,144 @@ def _extract_text(openai_response) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Structured swarm error classification
+# ---------------------------------------------------------------------------
+#
+# Every swarm candidate that fails carries an ``error_kind`` from the small
+# set below so callers (notably the openclaw embedded-agent runtime) can fail
+# soft on a known-bad agent without parsing prose. Add new kinds rarely and
+# document them here — clients pin against this enum.
+#
+#   no_models_loaded     LM Studio is reachable but has zero models loaded.
+#   model_not_resolved   The agent's spec (role:..., id, glob) didn't match
+#                        anything loaded *or* installed.
+#   oom                  LM Studio refused to JIT-load due to insufficient RAM.
+#   model_crashed        LM Studio reported the loaded model crashed mid-call.
+#   empty_response       LM Studio returned 200 with an empty assistant
+#                        ``content`` (typical with reasoning models when the
+#                        whole token budget is consumed by reasoning_content).
+#                        The raw response is still on the candidate so callers
+#                        can fall back to ``reasoning_content`` if they want.
+#   timeout              Our timeout (SWARM_PER_CALL_TIMEOUT) tripped.
+#   connection_error     We couldn't reach LM Studio at all.
+#   upstream_4xx         Other 4xx from LM Studio / Anthropic.
+#   upstream_5xx         5xx from LM Studio / Anthropic (HTML error pages,
+#                        Internal Server Error, etc.).
+#   config_error         Local misconfiguration (no ANTHROPIC_API_KEY, LiteLLM
+#                        not installed, etc.). Caller's deployment problem.
+#   anthropic_error      Anthropic adapter raised a non-HTTP exception.
+#   litellm_error        LiteLLM adapter raised a non-HTTP exception.
+#   unknown              Anything we couldn't classify.
+_SWARM_ERROR_KINDS = frozenset({
+    "no_models_loaded", "model_not_resolved",
+    "oom", "model_crashed", "empty_response",
+    "timeout", "connection_error",
+    "upstream_4xx", "upstream_5xx",
+    "config_error", "anthropic_error", "litellm_error",
+    "unknown",
+})
+
+_OOM_PHRASES = (
+    "insufficient system resources",
+    "would likely overload your system",
+    "model loading was stopped",
+)
+_CRASH_PHRASES = (
+    "the model has crashed",
+    "model has crashed without additional information",
+)
+
+
+def _extract_upstream_status(error_str: str) -> int | None:
+    """Pull the upstream HTTP status (LM Studio / Anthropic) out of an error
+    string we generated upstream-side. Returns None if no status is encoded.
+    """
+    if not isinstance(error_str, str):
+        return None
+    m = re.match(r"^(?:LM Studio|Anthropic)\s+(\d{3})\s*:", error_str)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    m2 = re.search(r"endpoint returned (\d{3})", error_str)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _classify_swarm_error(error_str, http_status: int | None = None) -> str:
+    """Map a per-agent error string (with optional upstream HTTP status) to a
+    stable ``error_kind`` from ``_SWARM_ERROR_KINDS``. The mapping is
+    deliberately string-based because every adapter (LM Studio, Anthropic,
+    LiteLLM) embeds its own prose; we never want to break the caller contract
+    when an upstream tweaks its message wording, so we match on phrase
+    fragments and fall back to ``unknown`` for safety.
+    """
+    if not error_str:
+        return "unknown"
+    s = str(error_str).strip()
+    sl = s.lower()
+
+    if http_status is None:
+        http_status = _extract_upstream_status(s)
+
+    # Connection / transport before HTTP status — a 4xx from our own retry of
+    # a connection error wouldn't make sense here.
+    if "cannot connect to lm studio" in sl or "connection refused" in sl:
+        return "connection_error"
+    if sl.startswith("timeout") or "timeout " in sl or "timed out" in sl:
+        return "timeout"
+
+    # Resolver-level failures (no loaded model / no match).
+    if "no model is loaded" in sl:
+        return "no_models_loaded"
+    if "no loaded lm studio model matched" in sl or "did not match" in sl:
+        return "model_not_resolved"
+    if "swarm.models expanded to an empty set" in sl:
+        return "no_models_loaded"
+
+    # Configuration problems we can't fix at runtime.
+    if "anthropic_api_key not set" in sl or "litellm not available" in sl:
+        return "config_error"
+
+    # OOM and model-crash are 4xx from LM Studio with specific phrases. Match
+    # the phrases first so we don't lose specificity to the generic "upstream_4xx".
+    if any(p in sl for p in _OOM_PHRASES):
+        return "oom"
+    if any(p in sl for p in _CRASH_PHRASES):
+        return "model_crashed"
+
+    # Generic upstream HTTP buckets.
+    if isinstance(http_status, int):
+        if 400 <= http_status < 500:
+            return "upstream_4xx"
+        if 500 <= http_status < 600:
+            return "upstream_5xx"
+
+    if "anthropic error:" in sl:
+        return "anthropic_error"
+    if "litellm error:" in sl:
+        return "litellm_error"
+
+    return "unknown"
+
+
+def _strip_upstream_prefix(error_str) -> str:
+    """Trim the ``LM Studio NNN: `` / ``Anthropic NNN: `` prefix so the
+    structured ``error_detail`` field carries the upstream payload only.
+    Falls back to the original string when no prefix is present.
+    """
+    if not isinstance(error_str, str):
+        return ""
+    m = re.match(r"^(?:LM Studio|Anthropic)\s+\d{3}\s*:\s*(.*)$", error_str, re.DOTALL)
+    return (m.group(1) if m else error_str).strip()
+
+
 def _normalize_agent_spec(spec):
     """Accept a string or dict and return a normalized agent dict."""
     if isinstance(spec, str):
@@ -915,7 +1297,66 @@ def _normalize_agent_spec(spec):
     return {"model": str(spec)}
 
 
-def _run_one_agent(spec, default_messages, default_kwargs, available):
+# Sentinel tokens that expand a swarm ``models`` list to whatever LM Studio
+# currently has loaded. Recognized in both ``swarm.models`` (per-request) and
+# the ``SWARM_CHAT_DEFAULT_MODELS`` env var. Order-preserving and de-duped.
+_SWARM_AUTO_TOKENS = frozenset({"auto", "loaded", "*", "all", "all-loaded"})
+
+
+def _is_auto_swarm_token(value) -> bool:
+    return isinstance(value, str) and value.strip().lower() in _SWARM_AUTO_TOKENS
+
+
+def _expand_swarm_models(spec, available=None):
+    """Expand sentinel tokens in a swarm models list to loaded LM Studio ids.
+
+    Recognized tokens (case-insensitive): ``auto``, ``loaded``, ``*``, ``all``,
+    ``all-loaded``. Each token is replaced inline with every model id currently
+    loaded on the LM Studio server, preserving order. Non-sentinel entries
+    (exact ids, ``role:...``, ``*substr*``, ``anthropic[:model]``, etc.) pass
+    through unchanged. Duplicate string entries are dropped to keep the fanout
+    small.
+
+    Returns ``(expanded_list, error_or_None)``. If a sentinel is present but
+    LM Studio reports zero loaded models, the sentinel contributes nothing;
+    the caller should error if the resulting list is empty.
+    """
+    if isinstance(spec, str):
+        items = [spec]
+    elif isinstance(spec, list):
+        items = list(spec)
+    else:
+        return None, "swarm.models must be a list or sentinel string"
+
+    needs_loaded = any(_is_auto_swarm_token(s) for s in items)
+    loaded = available
+    if needs_loaded and loaded is None:
+        loaded, err = get_lmstudio_model_ids()
+        if err:
+            return None, err
+
+    out = []
+    seen = set()
+    for entry in items:
+        if _is_auto_swarm_token(entry):
+            for mid in (loaded or []):
+                if not isinstance(mid, str) or mid in seen:
+                    continue
+                seen.add(mid)
+                out.append(mid)
+            continue
+        if isinstance(entry, str):
+            key = entry.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        else:
+            out.append(entry)
+    return out, None
+
+
+def _run_one_agent(spec, default_messages, default_kwargs, available, loaded=None):
     """Run one agent. Returns (resolved_model_id_or_label, response, error, latency_ms)."""
     spec = _normalize_agent_spec(spec)
     requested = spec.get("model")
@@ -943,12 +1384,17 @@ def _run_one_agent(spec, default_messages, default_kwargs, available):
         resp, err = _call_anthropic_chat(msgs, model_override=override, **kwargs)
         return label, resp, err, int((time.time() - t0) * 1000)
 
-    # LM Studio participant.
-    model_id, err = resolve_model_id(requested, available)
+    # LM Studio participant. Same-model agents serialize through a per-model
+    # semaphore so a 3-way fanout that all resolves to one loaded id doesn't
+    # fire 2-3 concurrent inference jobs at LM Studio (which crashes large
+    # MoE models at high ctx).
+    model_id, err = resolve_model_id(requested, available, loaded=loaded)
     if err:
         return requested or "?", None, err, 0
+    sem = _per_model_semaphore(model_id)
     t0 = time.time()
-    resp, err = _lmstudio_chat_completion(model_id, msgs, **kwargs)
+    with sem:
+        resp, err = _lmstudio_chat_completion(model_id, msgs, **kwargs)
     return model_id, resp, err, int((time.time() - t0) * 1000)
 
 
@@ -969,14 +1415,34 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None):
             return None, err
         available = []
 
+    # Probe loaded ids once for the whole fanout so every agent sees the same
+    # snapshot and we don't ask LM Studio 3x in parallel.
+    loaded = None
+    if PREFER_LOADED_MODELS and available:
+        loaded, _lerr = get_loaded_lmstudio_model_ids()
+
     cap = MAX_PARALLEL_MODEL_CALLS
     if isinstance(max_parallel, int) and max_parallel > 0:
         cap = min(cap, max_parallel)
     results = [None] * len(specs)
     workers = max(1, min(cap, len(specs)))
+
+    def _spec_to_agent_id(spec) -> str:
+        """Stable, caller-visible label for the agent. Preserves the original
+        request shape (role:reasoner, anthropic:claude-..., raw id, glob) so
+        the openclaw runtime can correlate per-candidate results back to the
+        slot it asked for, even if resolution lands on a fallback model.
+        """
+        if isinstance(spec, str):
+            return spec
+        if isinstance(spec, dict):
+            m = spec.get("model")
+            return str(m) if m is not None else "?"
+        return str(spec)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
-            pool.submit(_run_one_agent, spec, messages, common_kwargs, available): i
+            pool.submit(_run_one_agent, spec, messages, common_kwargs, available, loaded): i
             for i, spec in enumerate(specs)
         }
         for fut in as_completed(futs):
@@ -986,55 +1452,230 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None):
             except Exception as e:  # noqa: BLE001
                 model_id, resp, latency = "?", None, 0
                 e = str(e)
+            text = _extract_text(resp) if resp else ""
+            api_ok = e is None and resp is not None
+            error_kind = None
+            http_status = None
+            error_detail = None
+            if not api_ok and e:
+                http_status = _extract_upstream_status(e)
+                error_kind = _classify_swarm_error(e, http_status=http_status)
+                error_detail = _strip_upstream_prefix(e)
+            elif api_ok and not text:
+                # 200 OK but the assistant ``content`` is empty. Common with
+                # reasoning models when ``max_tokens`` is consumed entirely by
+                # ``reasoning_content`` (we keep ``response`` on the candidate
+                # so callers can recover the chain-of-thought if they want).
+                error_kind = "empty_response"
+                error_detail = (
+                    "upstream returned 200 with empty assistant content "
+                    "(check reasoning_content / increase max_tokens)"
+                )
+                e = "empty assistant content"
+            # Swarm logic treats "no usable text" as a fail (it can't vote on
+            # nothing), so collapse api_ok + empty text into ok=False here.
+            ok = api_ok and bool(text)
             results[i] = {
+                "agent_id": _spec_to_agent_id(specs[i]),
                 "model": model_id,
-                "ok": e is None and resp is not None,
+                "ok": ok,
                 "error": e,
+                "error_kind": error_kind,
+                "http_status": http_status,
+                "error_detail": error_detail,
                 "latency_ms": latency,
                 "response": resp,
-                "text": _extract_text(resp) if resp else "",
+                "text": text,
             }
     return results, None
 
 
-def _is_swarm_chat_model(requested_model) -> bool:
+# ---------------------------------------------------------------------------
+# Swarm meta-model name → intent map
+# ---------------------------------------------------------------------------
+#
+# Three legitimate intents reach ``/v1/chat/completions`` via the ``model:``
+# field; everything else has a richer shape and lives on a dedicated route
+# (``POST /swarm/fanout`` / ``/swarm/vote`` / ``/swarm/pipeline``).
+#
+#   council   best-of-n with a judge model. Default for every alias that
+#             historically meant "vote / pick the winner".
+#   fanout    no judge; return the first successful candidate. Useful when
+#             the caller wants speed over consensus.
+#   pipeline  not implementable as a chat meta-model — pipeline needs
+#             ``stages[]`` which the OpenAI chat shape cannot carry. We keep
+#             the alias so old clients get a *helpful* 400 redirecting them
+#             to ``POST /swarm/pipeline`` instead of a silent fallthrough.
+#
+# Canonical names are listed first; alias entries marked ``deprecated`` emit
+# one DeprecationWarning per process the first time they're seen, per the
+# AGENTS.md non-negotiable on deprecation paths.
+_SWARM_CHAT_INTENTS: dict[str, tuple[str, bool]] = {
+    # name (lowercased) -> (intent, deprecated)
+    "swarmcouncil":        ("council", False),
+    "swarmvote":           ("council", False),
+    "swarm/vote":          ("council", False),
+    "swarmintelligence":   ("council", True),   # openclaw runtime alias; will be removed in 0.2.0
+    "swarm/fanout":        ("fanout", False),
+    "swarm/pipeline":      ("pipeline", False),
+}
+_SWARM_CHAT_CANONICAL = "swarmCouncil"
+_swarm_alias_warned: set[str] = set()
+
+
+def _swarm_chat_intent(requested_model) -> tuple[str, str] | tuple[None, None]:
+    """Return ``(intent, canonical_name)`` for a swarm meta-model, or
+    ``(None, None)`` for a regular model id. ``intent`` is one of
+    ``"council"``, ``"fanout"``, ``"pipeline"``. Emits a one-shot
+    ``DeprecationWarning`` for deprecated aliases so old clients see the new
+    name without breaking. Comparison is case-insensitive but otherwise exact
+    — no substring matching, so a model literally named ``my-swarm-vote``
+    won't be intercepted.
+    """
     if not isinstance(requested_model, str):
-        return False
+        return None, None
     name = requested_model.strip().lower()
-    return name in {
-        "swarmcouncil",
-        "swarmvote",
-        "swarm/vote",
-        "swarm/fanout",
-        "swarm/pipeline",
+    entry = _SWARM_CHAT_INTENTS.get(name)
+    if entry is None:
+        return None, None
+    intent, deprecated = entry
+    if deprecated and name not in _swarm_alias_warned:
+        _swarm_alias_warned.add(name)
+        warnings.warn(
+            f"swarm meta-model {requested_model!r} is a deprecated alias for "
+            f"{_SWARM_CHAT_CANONICAL!r}; will be removed in 0.2.0. "
+            f"Update your client to send model={_SWARM_CHAT_CANONICAL!r}.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    canonical = _SWARM_CHAT_CANONICAL if intent == "council" else f"swarm/{intent}"
+    return intent, canonical
+
+
+def _is_swarm_chat_model(requested_model) -> bool:
+    """Back-compat predicate. Prefer ``_swarm_chat_intent`` for new code."""
+    intent, _ = _swarm_chat_intent(requested_model)
+    return intent is not None
+
+
+def _summarize_failed_candidates(candidates) -> dict:
+    """Build the structured ``error_details`` body returned alongside the
+    legacy prose error when every swarm agent fails. Shape is documented in
+    ``docs/capabilities.md``; openclaw / other callers should treat
+    ``error_kind`` values as a stable enum (see ``_SWARM_ERROR_KINDS``).
+    """
+    agents = []
+    kinds: dict[str, int] = {}
+    statuses: dict[int, int] = {}
+    for c in candidates or []:
+        kind = c.get("error_kind") or "unknown"
+        kinds[kind] = kinds.get(kind, 0) + 1
+        st = c.get("http_status")
+        if isinstance(st, int):
+            statuses[st] = statuses.get(st, 0) + 1
+        agents.append({
+            "agent_id": c.get("agent_id"),
+            "model": c.get("model"),
+            "ok": bool(c.get("ok")),
+            "error_kind": kind,
+            "http_status": c.get("http_status"),
+            "error_detail": c.get("error_detail") or c.get("error"),
+            "latency_ms": c.get("latency_ms"),
+        })
+    # Choose the summary line based on whether the cohort is uniformly an
+    # empty_response problem (caller likely needs to raise max_tokens) vs a
+    # mixed failure mode (caller probably needs to retry / reload models).
+    if kinds and set(kinds.keys()) == {"empty_response"}:
+        summary = (
+            "all swarm agents returned empty content "
+            "(likely max_tokens too low for reasoning models; check "
+            "reasoning_content on each candidate.response)"
+        )
+    else:
+        summary = "all swarm agents failed"
+    # Surface ALL distinct kinds so callers can decide between fail-fast and
+    # retry-once policies without parsing the prose summary.
+    return {
+        "summary": summary,
+        "agent_count": len(agents),
+        "kinds": kinds,
+        "upstream_statuses": statuses,
+        "agents": agents,
     }
 
 
-def _run_swarm_chat_completion(requested_model: str, json_data: dict):
-    """Execute swarm logic and return an OpenAI-shaped chat completion dict."""
+def _run_swarm_chat_completion(requested_model: str, json_data: dict, intent: str = "council"):
+    """Execute swarm logic and return ``(body, err_str, err_details)``.
+
+    ``intent`` (from ``_swarm_chat_intent``) selects the implicit strategy
+    when the request body omits ``swarm.strategy``:
+
+      ``council``  -> ``SWARM_CHAT_DEFAULT_STRATEGY`` (best-of-n with judge)
+      ``fanout``   -> ``"fanout"`` (no judge; return first successful)
+      ``pipeline`` -> immediate 400 redirecting to POST /swarm/pipeline
+                      because OpenAI chat shape can't carry ``stages[]``.
+
+    ``err_details`` is non-None only on the *all-agents-failed* branch; the
+    HTTP route handler surfaces it as ``error_details`` in the JSON 502 body
+    so clients can dispatch on ``error_kind`` instead of parsing the prose
+    summary. Pre-fanout validation failures still return the legacy
+    ``(None, err_str, None)`` shape — there's no per-agent breakdown yet.
+    """
+    if intent == "pipeline":
+        # Pipeline genuinely needs ``stages[]`` (per-step model + prompt
+        # template). The OpenAI chat shape only carries ``messages[]``, so
+        # silently routing to best-of-n would be a worse lie than rejecting.
+        return None, (
+            "swarm/pipeline cannot run on /v1/chat/completions because the "
+            "OpenAI chat shape cannot carry 'stages[]'. Send your request to "
+            "POST /swarm/pipeline (with {stages: [{model, prompt_prefix}, ...], "
+            "input}) instead."
+        ), None
+
     messages = json_data.get("messages") or []
     if not isinstance(messages, list) or not messages:
-        return None, "messages (list) is required for swarm chat"
+        return None, "messages (list) is required for swarm chat", None
 
     common = {k: json_data.get(k) for k in ("max_tokens", "temperature", "top_p")}
     common = {k: v for k, v in common.items() if v is not None}
 
     swarm_cfg = json_data.get("swarm") if isinstance(json_data.get("swarm"), dict) else {}
     models = swarm_cfg.get("models") or SWARM_CHAT_DEFAULT_MODELS
-    strategy = (swarm_cfg.get("strategy") or SWARM_CHAT_DEFAULT_STRATEGY).lower()
+    # Intent-aware default strategy: ``swarm/fanout`` defaults to no-judge
+    # fanout regardless of SWARM_CHAT_DEFAULT_STRATEGY. Explicit
+    # swarm.strategy in the body still wins (caller is the source of truth).
+    if swarm_cfg.get("strategy"):
+        strategy = swarm_cfg["strategy"].lower()
+    elif intent == "fanout":
+        strategy = "fanout"
+    else:
+        strategy = SWARM_CHAT_DEFAULT_STRATEGY.lower()
     max_parallel = swarm_cfg.get("max_parallel")
 
-    if not isinstance(models, list) or not models:
-        return None, "swarm.models must be a non-empty list"
+    if not isinstance(models, (list, str)) or not models:
+        return None, "swarm.models must be a non-empty list (or 'auto')", None
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return None, exp_err, None
+    if not models:
+        return None, (
+            "swarm.models expanded to an empty set: no models are loaded in "
+            "LM Studio. Load at least one model (or pass an explicit swarm.models)."
+        ), None
 
     candidates, err = _fanout(models, messages, common, max_parallel=max_parallel)
     if err:
-        return None, err
+        return None, err, None
 
     successes = [c for c in candidates if c["ok"] and c.get("text")]
     if not successes:
         errs = "; ".join(c.get("error") or "unknown" for c in candidates)
-        return None, f"all swarm agents failed: {errs}"
+        return (
+            None,
+            f"all swarm agents failed: {errs}",
+            _summarize_failed_candidates(candidates),
+        )
 
     winner = None
     rationale = ""
@@ -1048,6 +1689,13 @@ def _run_swarm_chat_completion(requested_model: str, json_data: dict):
     elif strategy == "longest":
         winner = max(successes, key=lambda c: len(c.get("text", "")))
         rationale = "longest non-empty response"
+    elif len(successes) == 1:
+        # best-of-n with a single survivor has nothing to compare; skip the
+        # judge call entirely. Avoids spending a 200-token judge round on a
+        # foregone conclusion AND prevents a busy judge model (e.g. another
+        # caller hammering qwen3.5-122b-a10b) from blocking the response.
+        winner = successes[0]
+        rationale = "single successful candidate; judge skipped"
     else:
         labels = [chr(ord("A") + i) for i in range(len(successes))]
         rendered = "\n\n".join(
@@ -1076,9 +1724,14 @@ def _run_swarm_chat_completion(requested_model: str, json_data: dict):
             winner = max(successes, key=lambda c: len(c.get("text", "")))
             rationale = f"judge unavailable ({jerr or 'no model'}); picked longest"
         else:
-            jresp, jerr = _lmstudio_chat_completion(
-                judge_id, judge_messages, max_tokens=200, temperature=0.0
-            )
+            # Route the judge call through the same per-model semaphore the
+            # agents use, so a busy judge model can't open a second concurrent
+            # inference job against an already-loaded MoE (which crashes LM
+            # Studio under high context — see LM_STUDIO_PER_MODEL_INFLIGHT_CAP).
+            with _per_model_semaphore(judge_id):
+                jresp, jerr = _lmstudio_chat_completion(
+                    judge_id, judge_messages, max_tokens=200, temperature=0.0
+                )
             verdict = _extract_text(jresp)
             picked_idx = None
             if verdict:
@@ -1114,7 +1767,7 @@ def _run_swarm_chat_completion(requested_model: str, json_data: dict):
             "requested_model": requested_model,
         },
     }
-    return out, None
+    return out, None, None
 
 
 def _swarm_body_to_sse_response(body: dict, *, chunk_chars: int = SWARM_STREAM_CHUNK_CHARS):
@@ -1207,6 +1860,7 @@ def swarm_models():
                 "anthropic_model": ANTHROPIC_MODEL if ANTHROPIC_API_KEY else None,
                 "litellm_available": _litellm_available(),
                 "litellm_for_anthropic": bool(USE_LITELLM_FOR_ANTHROPIC),
+                "swarm_chat_auto_tokens": sorted(_SWARM_AUTO_TOKENS),
                 "error": err,
             }
         ),
@@ -1227,16 +1881,30 @@ def swarm_fanout():
         "temperature": 0.7,        # optional
         "max_parallel": 3          # optional override (capped by env)
       }
+
+    "models" also accepts the sentinel "auto" (or "loaded" / "*" / "all"),
+    either as a bare string or as one entry in the list. Sentinels expand
+    inline to every model currently loaded in LM Studio (de-duped, ordered).
     """
     data = request.get_json(silent=True) or {}
     models = data.get("models") or []
     messages = data.get("messages") or []
-    if not isinstance(models, list) or not models:
-        return Response(json.dumps({"error": "models (list) is required"}),
+    if not isinstance(models, (list, str)) or not models:
+        return Response(json.dumps({"error": "models (list, or 'auto') is required"}),
                         status=400, mimetype="application/json")
     if not isinstance(messages, list) or not messages:
         return Response(json.dumps({"error": "messages (list) is required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if not models:
+        return Response(
+            json.dumps({"error": "no LM Studio models loaded; load at least one or pass explicit models"}),
+            status=503, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
     common = {k: v for k, v in common.items() if v is not None}
@@ -1280,9 +1948,20 @@ def swarm_vote():
     messages = data.get("messages") or []
     strategy = (data.get("strategy") or "best-of-n").lower()
 
-    if not isinstance(models, list) or not models or not isinstance(messages, list) or not messages:
+    models_ok = isinstance(models, (list, str)) and models
+    if not models_ok or not isinstance(messages, list) or not messages:
         return Response(json.dumps({"error": "models and messages are required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if not models:
+        return Response(
+            json.dumps({"error": "no LM Studio models loaded; load at least one or pass explicit models"}),
+            status=503, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")
               if data.get(k) is not None}
@@ -1334,9 +2013,11 @@ def swarm_vote():
             winner = max(successes, key=lambda c: len(c.get("text", "")))
             rationale = f"judge unavailable ({jerr or 'no model'}); picked longest"
         else:
-            jresp, jerr = _lmstudio_chat_completion(
-                judge_id, judge_messages, max_tokens=200, temperature=0.0
-            )
+            # See chat-route judge above — same per-model semaphore policy.
+            with _per_model_semaphore(judge_id):
+                jresp, jerr = _lmstudio_chat_completion(
+                    judge_id, judge_messages, max_tokens=200, temperature=0.0
+                )
             verdict = _extract_text(jresp)
             picked_idx = None
             if verdict:
@@ -1492,8 +2173,14 @@ def swarm_pipeline():
 def main() -> None:
     port = int(os.environ.get("PORT", 5000))
     host = os.environ.get("HOST", "127.0.0.1")
+    try:
+        _enforce_safe_bind(host, MIDDLE_LAYER_API_KEY)
+    except _PublicBindWithoutAuthError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        sys.exit(2)
     print(f"Starting middle_layer on port {port}...")
     print(f"Listening on host: {host}")
+    print(f"Max request body: {app.config['MAX_CONTENT_LENGTH']} bytes")
     print(f"LM Studio URL: {LM_STUDIO_URL}")
     if MIDDLE_LAYER_API_KEY:
         print("Auth: enabled (X-API-Key required)")

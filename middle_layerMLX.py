@@ -91,6 +91,13 @@ try:
 except ImportError:
     _FlaskCORS = None
 
+# --- Shared security helpers (Pass 4) -----------------------------------------
+from middle_layer.security import apply_security_headers as _apply_security_headers  # noqa: E402
+from middle_layer.security import check_api_key as _check_api_key  # noqa: E402
+from middle_layer.security import enforce_safe_bind as _enforce_safe_bind  # noqa: E402
+from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError  # noqa: E402
+from middle_layer.security import resolve_max_request_bytes as _resolve_max_request_bytes  # noqa: E402
+
 # --- MLX (optional but expected) ---------------------------------------------
 try:
     import mlx_lm
@@ -117,6 +124,7 @@ logging.basicConfig(
 log = logging.getLogger("middle_layerMLX")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = _resolve_max_request_bytes()
 
 # =============================================================================
 # CONFIGURATION
@@ -2226,6 +2234,159 @@ def _swarm_fanout_budget_seconds(spec_count: int) -> float:
     return float(min(3600.0, per * n))
 
 
+def _parse_judge_verdict(verdict, labels):
+    """Extract the chosen candidate index from a judge model's free-form reply.
+
+    The prompt asks the judge to "reply with ONLY the letter on its own line",
+    but real models routinely answer with ``**A**``, ``Answer: A``, ``[A]``,
+    ``I pick A because…``, or just embed the letter in prose. A brittle
+    ``^A\\b`` regex falls through to the "longest" fallback on any of those,
+    which silently degrades vote into a length contest.
+
+    Patterns are tried strict-first to keep ambiguous answers from being
+    over-eagerly matched. Returns the index into ``labels`` of the selected
+    candidate, or ``None`` if no label can be identified.
+    """
+    if not isinstance(verdict, str) or not verdict.strip():
+        return None
+    if not labels:
+        return None
+    text = verdict.strip()
+    label_class = "[" + "".join(re.escape(lab) for lab in labels) + "]"
+
+    patterns = (
+        # Bare label on its own line, optionally bold / bracketed / parenthesized.
+        rf"(?m)^\s*\**\(?\[?({label_class})\]?\)?\**\s*[.\):,!?\-]?\s*$",
+        # Label at start of a line (with possible trailing prose).
+        rf"(?m)^\s*\**({label_class})\**\b",
+        # Explicit declarations: "answer is A", "pick A", "winner: A", etc.
+        rf"(?i)(?:answer|pick|choose|winner|verdict|best|select|chosen|choice)"
+        rf"(?:\s+is)?[:\s]+\**\(?\[?({label_class})\]?\)?\**\b",
+        # Bold / bracketed / parenthesized letter anywhere.
+        rf"\*\*({label_class})\*\*",
+        rf"\[({label_class})\]",
+        rf"\(({label_class})\)",
+        # Last resort: first standalone label letter occurrence anywhere.
+        rf"\b({label_class})\b",
+    )
+
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            letter = m.group(1).upper()
+            try:
+                return labels.index(letter)
+            except ValueError:
+                continue
+    return None
+
+
+def _substitute_pipeline_template(template, ctx):
+    """Substitute ``{{name}}`` placeholders without triggering ``str.format``.
+
+    The previous implementation used ``re.sub`` to map ``{{name}}`` -> ``{name}``
+    then ran ``template.format(**ctx)``, which exploded on any earlier stage
+    output that contained literal ``{`` or ``}`` (e.g. Python f-strings, dict
+    literals, JSON). The ``except (KeyError, IndexError)`` branch silently
+    returned the original template with placeholders intact, so downstream
+    stages received literal ``{{previous}}`` instead of the prior text.
+
+    This version does direct replacement on ``{{name}}`` only, so values
+    containing braces are inert. Unknown keys are left as their literal
+    ``{{name}}`` placeholder (matches the prior behavior's intent).
+    """
+    if not isinstance(template, str):
+        return template
+    if not template or "{{" not in template:
+        return template
+    result = template
+    if isinstance(ctx, dict):
+        for key, value in ctx.items():
+            if not isinstance(key, str):
+                continue
+            needle = "{{" + key + "}}"
+            if needle in result:
+                result = result.replace(needle, "" if value is None else str(value))
+    return result
+
+
+# Sentinel tokens that expand a swarm ``models`` list to whatever the MLX
+# manager has currently in memory. Recognized in both ``swarm.models``
+# (per-request) and the ``SWARM_CHAT_DEFAULT_MODELS`` env var. ``available``
+# / ``configured`` map to the broader registry (lazy-loadable aliases) so
+# users can opt into the wider fanout when nothing is preloaded.
+_SWARM_AUTO_LOADED_TOKENS = frozenset({"auto", "loaded", "*", "all", "all-loaded"})
+_SWARM_AUTO_AVAILABLE_TOKENS = frozenset({"available", "configured", "all-available"})
+_SWARM_AUTO_TOKENS = _SWARM_AUTO_LOADED_TOKENS | _SWARM_AUTO_AVAILABLE_TOKENS
+
+
+def _is_auto_swarm_token(value) -> bool:
+    return isinstance(value, str) and value.strip().lower() in _SWARM_AUTO_TOKENS
+
+
+def _expand_swarm_models(spec):
+    """Expand sentinel tokens in a swarm models list to MLX aliases.
+
+    ``auto`` / ``loaded`` / ``*`` / ``all`` / ``all-loaded`` -> currently
+    loaded MLX aliases (``mlx_manager.get_loaded_aliases()``). If nothing is
+    loaded yet, falls back to every configured alias so the swarm still has
+    something to fan out to (MLX lazy-loads on demand).
+
+    ``available`` / ``configured`` / ``all-available`` -> every configured
+    alias in the registry (``mlx_manager.get_available_aliases()``).
+
+    Non-sentinel entries (exact aliases, ``role:...``, wildcards,
+    ``anthropic[:model]``, etc.) pass through unchanged. Duplicate string
+    entries are dropped to keep the fanout small.
+
+    Returns ``(expanded_list, error_or_None)``. The caller should treat an
+    empty result as a hard error.
+    """
+    if isinstance(spec, str):
+        items = [spec]
+    elif isinstance(spec, list):
+        items = list(spec)
+    else:
+        return None, "swarm.models must be a list or sentinel string"
+
+    loaded_cache = None
+    available_cache = None
+
+    out = []
+    seen = set()
+    for entry in items:
+        if isinstance(entry, str) and entry.strip().lower() in _SWARM_AUTO_LOADED_TOKENS:
+            if loaded_cache is None:
+                loaded_cache = mlx_manager.get_loaded_aliases() or []
+                if not loaded_cache:
+                    # Lazy-load fallback: registry knows what *can* run.
+                    loaded_cache = mlx_manager.get_available_aliases() or []
+            for alias in loaded_cache:
+                if not isinstance(alias, str) or alias in seen:
+                    continue
+                seen.add(alias)
+                out.append(alias)
+            continue
+        if isinstance(entry, str) and entry.strip().lower() in _SWARM_AUTO_AVAILABLE_TOKENS:
+            if available_cache is None:
+                available_cache = mlx_manager.get_available_aliases() or []
+            for alias in available_cache:
+                if not isinstance(alias, str) or alias in seen:
+                    continue
+                seen.add(alias)
+                out.append(alias)
+            continue
+        if isinstance(entry, str):
+            key = entry.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        else:
+            out.append(entry)
+    return out, None
+
+
 def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id=None, route_kind="swarm_fanout"):
     if not specs:
         return None, "swarm requires at least one model"
@@ -2369,8 +2530,17 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
     strategy = (swarm_cfg.get("strategy") or SWARM_CHAT_DEFAULT_STRATEGY).lower()
     max_parallel = swarm_cfg.get("max_parallel")
 
-    if not isinstance(models, list) or not models:
-        return None, "swarm.models must be a non-empty list"
+    if not isinstance(models, (list, str)) or not models:
+        return None, "swarm.models must be a non-empty list (or 'auto')"
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return None, exp_err
+    if not models:
+        return None, (
+            "swarm.models expanded to an empty set: no MLX models loaded or "
+            "configured. Pass an explicit list or load/register at least one alias."
+        )
 
     candidates, err = _fanout(
         models,
@@ -2452,17 +2622,12 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
                     preview=_mlx_dash.build_preview(judge_messages),
                 )
             verdict = _extract_text(jresp)
-            picked_idx = None
-            if verdict:
-                for i, lab in enumerate(labels):
-                    if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                        picked_idx = i
-                        break
+            picked_idx = _parse_judge_verdict(verdict, labels)
             if picked_idx is None:
                 winner = max(successes, key=lambda c: len(c.get("text", "")))
                 rationale = (
                     f"judge response unparseable; fell back to longest. "
-                    f"Verdict: {verdict[:140]}"
+                    f"Verdict: {(verdict or '')[:140]}"
                 )
             else:
                 winner = successes[picked_idx]
@@ -2580,13 +2745,13 @@ def _auth_guard():
         or (p.startswith("/dashboard/") and not p.startswith("/dashboard/api/"))
     ):
         return None
-    x_api_key = request.headers.get("X-API-Key")
-    authz = request.headers.get("Authorization", "")
-    bearer = authz[len("Bearer "):] if authz.startswith("Bearer ") else None
-    if x_api_key != MIDDLE_LAYER_API_KEY and bearer != MIDDLE_LAYER_API_KEY:
-        return Response(json.dumps({"error": "Unauthorized"}),
-                        status=401, mimetype="application/json")
-    return None
+    if _check_api_key(request.headers, MIDDLE_LAYER_API_KEY):
+        return None
+    return Response(
+        json.dumps({"error": "Unauthorized"}),
+        status=401,
+        mimetype="application/json",
+    )
 
 
 @app.before_request
@@ -2602,6 +2767,12 @@ def _log_request(response):
         "%s %s -> %d (%dms) model=%s",
         request.method, request.path, response.status_code, elapsed, model_routed,
     )
+    return response
+
+
+@app.after_request
+def _security_headers(response):
+    _apply_security_headers(response, path=request.path or "")
     return response
 
 
@@ -2652,6 +2823,8 @@ def healthz():
             "swarm_chat_enabled": bool(SWARM_CHAT_ENABLED),
             "swarm_chat_default_models": SWARM_CHAT_DEFAULT_MODELS,
             "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
+            "swarm_chat_auto_tokens_loaded": sorted(_SWARM_AUTO_LOADED_TOKENS),
+            "swarm_chat_auto_tokens_available": sorted(_SWARM_AUTO_AVAILABLE_TOKENS),
             "dashboard": "http://<host>:<port>/dashboard/" if _mlx_dash is not None else None,
             "model_profiles_file": MODEL_PROFILES_PATH if os.path.isfile(MODEL_PROFILES_PATH) else None,
             "mlx_per_model_admission_cap_legacy": _legacy_admission_cap or None,
@@ -3270,6 +3443,8 @@ def swarm_models():
             "swarm_chat_enabled": bool(SWARM_CHAT_ENABLED),
             "swarm_chat_default_models": SWARM_CHAT_DEFAULT_MODELS,
             "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
+            "swarm_chat_auto_tokens_loaded": sorted(_SWARM_AUTO_LOADED_TOKENS),
+            "swarm_chat_auto_tokens_available": sorted(_SWARM_AUTO_AVAILABLE_TOKENS),
         }),
         status=200, mimetype="application/json",
     )
@@ -3289,12 +3464,22 @@ def swarm_fanout():
     data = request.get_json(silent=True) or {}
     models = data.get("models") or []
     messages = data.get("messages") or []
-    if not isinstance(models, list) or not models:
-        return Response(json.dumps({"error": "models (list) is required"}),
+    if not isinstance(models, (list, str)) or not models:
+        return Response(json.dumps({"error": "models (list, or 'auto') is required"}),
                         status=400, mimetype="application/json")
     if not isinstance(messages, list) or not messages:
         return Response(json.dumps({"error": "messages (list) is required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if not models:
+        return Response(
+            json.dumps({"error": "no MLX models loaded or configured; pass explicit models"}),
+            status=503, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
     common = {k: v for k, v in common.items() if v is not None}
@@ -3330,9 +3515,20 @@ def swarm_vote():
     models = data.get("models") or []
     messages = data.get("messages") or []
     strategy = (data.get("strategy") or "best-of-n").lower()
-    if not (isinstance(models, list) and models and isinstance(messages, list) and messages):
+    models_ok = isinstance(models, (list, str)) and models
+    if not (models_ok and isinstance(messages, list) and messages):
         return Response(json.dumps({"error": "models and messages are required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if not models:
+        return Response(
+            json.dumps({"error": "no MLX models loaded or configured; pass explicit models"}),
+            status=503, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p") if data.get(k) is not None}
     swarm_parent_id = str(uuid.uuid4())
@@ -3411,16 +3607,11 @@ def swarm_vote():
                     preview=_mlx_dash.build_preview(judge_messages),
                 )
             verdict = _extract_text(jresp)
-            picked_idx = None
-            if verdict:
-                for i, lab in enumerate(labels):
-                    if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                        picked_idx = i
-                        break
+            picked_idx = _parse_judge_verdict(verdict, labels)
             if picked_idx is None:
                 winner = max(successes, key=lambda c: len(c.get("text", "")))
                 rationale = (f"judge response unparseable; fell back to longest. "
-                             f"Verdict: {verdict[:140]}")
+                             f"Verdict: {(verdict or '')[:140]}")
             else:
                 winner = successes[picked_idx]
                 rationale = verdict.strip()
@@ -3473,23 +3664,17 @@ def swarm_pipeline():
         ctx = {h["name"]: h["text"] for h in history}
         ctx["previous"] = last_text
 
-        def _fmt(template):
-            if not isinstance(template, str):
-                return template
-            t = re.sub(r"\{\{(\w+)\}\}", r"{\1}", template)
-            try:
-                return t.format(**ctx)
-            except (KeyError, IndexError):
-                return template
-
-        sys_prompt = _fmt(step.get("system") or "")
+        sys_prompt = _substitute_pipeline_template(step.get("system") or "", ctx)
         user_template = step.get("user")
 
         agent_messages = []
         if sys_prompt:
             agent_messages.append({"role": "system", "content": sys_prompt})
         if user_template:
-            agent_messages.append({"role": "user", "content": _fmt(user_template)})
+            agent_messages.append({
+                "role": "user",
+                "content": _substitute_pipeline_template(user_template, ctx),
+            })
         else:
             agent_messages += [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
 
@@ -3569,12 +3754,22 @@ def swarm_debate():
     rounds = data.get("rounds", 2)
     judge_model = data.get("judge", "role:reasoner")
 
-    if not isinstance(models, list) or len(models) < 2:
-        return Response(json.dumps({"error": "debate requires at least 2 models"}),
+    if not isinstance(models, (list, str)) or not models:
+        return Response(json.dumps({"error": "debate requires a non-empty models list (or 'auto')"}),
                         status=400, mimetype="application/json")
     if not isinstance(messages, list) or not messages:
         return Response(json.dumps({"error": "messages (list) is required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if len(models) < 2:
+        return Response(
+            json.dumps({"error": "debate requires at least 2 models after expansion"}),
+            status=400, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p") if data.get(k) is not None}
     available = mlx_manager.get_available_aliases()
@@ -3955,10 +4150,17 @@ def main():
     host = args.host
     port = args.port
 
+    try:
+        _enforce_safe_bind(host, MIDDLE_LAYER_API_KEY)
+    except _PublicBindWithoutAuthError as exc:
+        log.error("%s", exc)
+        sys.exit(2)
+
     _configure_mlx_dashboard(register_blueprint=False)
     if _mlx_dash is not None:
         log.info("Dashboard: http://%s:%d/dashboard/ (set MLX_DASHBOARD_ENABLED=0 to disable)", host, port)
     log.info("Listening on %s:%d", host, port)
+    log.info("Max request body: %d bytes", app.config["MAX_CONTENT_LENGTH"])
     app.run(host=host, port=port, debug=False, threaded=True)
 
 
