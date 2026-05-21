@@ -836,3 +836,51 @@ def test_mlx_swarm_expansion_matrix() -> None:
     assert result["mixed"] == ["beta", "alpha", "anthropic"]
     assert result["available"] == ["alpha", "beta", "gamma"]
     assert result["loaded_falls_back"] == ["alpha", "beta"]
+
+
+def test_mlx_swarm_intent_map_is_shared_with_lmstudio_gateway() -> None:
+    """Pass-3 wired the MLX gateway through ``middle_layer.swarm`` for the
+    intent map and structured-error helpers. Pin the alias contract from
+    inside the MLX process so a regression can't desync the two gateways:
+    callers sending ``swarmIntelligence`` to either ``middle_layer.py`` or
+    ``middle_layerMLX.py`` must get the same intent + canonical name +
+    deprecation warning behavior.
+    """
+    snippet = """
+    import warnings as _w
+
+    out = {}
+    out["council"] = mod._swarm_chat_intent("swarmCouncil")
+    out["fanout"] = mod._swarm_chat_intent("swarm/fanout")
+    out["pipeline"] = mod._swarm_chat_intent("swarm/pipeline")
+
+    # Deprecation warning fires once for swarmIntelligence.
+    mod._SWARM_CHAT_INTENTS  # ensure attr exists
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        out["alias"] = mod._swarm_chat_intent("swarmIntelligence")
+    out["dep_warn"] = any(
+        issubclass(w.category, DeprecationWarning) for w in caught
+    )
+    out["dep_msg_mentions_canonical"] = any(
+        "swarmCouncil" in str(w.message)
+        for w in caught
+        if issubclass(w.category, DeprecationWarning)
+    )
+
+    out["non_swarm"] = mod._swarm_chat_intent("granite-4.1-8b")
+    out["alias_count"] = len(mod._SWARM_CHAT_INTENTS)
+    out["canonical"] = mod._SWARM_CHAT_CANONICAL
+    print("RESULT=" + json.dumps(out))
+    """
+    result = _run_mlx_subprocess(snippet)
+    # Tuples become lists across the JSON boundary.
+    assert result["council"] == ["council", "swarmCouncil"]
+    assert result["fanout"] == ["fanout", "swarm/fanout"]
+    assert result["pipeline"] == ["pipeline", "swarm/pipeline"]
+    assert result["alias"] == ["council", "swarmCouncil"]
+    assert result["dep_warn"] is True
+    assert result["dep_msg_mentions_canonical"] is True
+    assert result["non_swarm"] == [None, None]
+    assert result["alias_count"] >= 6
+    assert result["canonical"] == "swarmCouncil"

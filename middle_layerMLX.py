@@ -98,6 +98,25 @@ from middle_layer.security import enforce_safe_bind as _enforce_safe_bind  # noq
 from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError  # noqa: E402
 from middle_layer.security import resolve_max_request_bytes as _resolve_max_request_bytes  # noqa: E402
 
+# --- Shared swarm primitives (Pass 3) -----------------------------------------
+# The MLX gateway shares the error classifier, intent map, structured
+# failure summarizer, and SSE generator with the LM Studio gateway. The IO
+# runners (run_one_agent / fanout / run_swarm_chat_completion) stay
+# MLX-specific because MLX has its own admission scheduler, fanout
+# deadline, and judge-verdict parser that don't belong in the shared module.
+from middle_layer.swarm import (  # noqa: E402, F401
+    classify_swarm_error as _classify_swarm_error,
+    extract_upstream_status as _extract_upstream_status,
+    spec_to_agent_id as _spec_to_agent_id,
+    strip_upstream_prefix as _strip_upstream_prefix,
+    summarize_failed_candidates as _summarize_failed_candidates,
+    swarm_chat_intent as _swarm_chat_intent,
+    swarm_response_headers as _swarm_response_headers,
+    SWARM_CHAT_CANONICAL as _SWARM_CHAT_CANONICAL,
+    SWARM_CHAT_INTENTS as _SWARM_CHAT_INTENTS,
+    SWARM_ERROR_KINDS as _SWARM_ERROR_KINDS,
+)
+
 # --- MLX (optional but expected) ---------------------------------------------
 try:
     import mlx_lm
@@ -2413,13 +2432,34 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
         except Exception as exc:  # noqa: BLE001
             label, resp, latency = "?", None, 0
             err = str(exc)
+        text = _extract_text(resp) if resp else ""
+        api_ok = err is None and resp is not None
+        error_kind = None
+        http_status = None
+        error_detail = None
+        if not api_ok and err:
+            http_status = _extract_upstream_status(err)
+            error_kind = _classify_swarm_error(err, http_status=http_status)
+            error_detail = _strip_upstream_prefix(err)
+        elif api_ok and not text:
+            error_kind = "empty_response"
+            error_detail = (
+                "MLX returned a response with empty assistant content "
+                "(check reasoning_content / increase max_tokens)"
+            )
+            err = "empty assistant content"
+        ok = api_ok and bool(text)
         results[slot] = {
+            "agent_id": _spec_to_agent_id(specs[slot]),
             "model": label,
-            "ok": err is None and resp is not None,
+            "ok": ok,
             "error": err,
+            "error_kind": error_kind,
+            "http_status": http_status,
+            "error_detail": error_detail,
             "latency_ms": latency,
             "response": resp,
-            "text": _extract_text(resp) if resp else "",
+            "text": text,
         }
         if _mlx_dash is not None and parent_request_id:
             spec = specs[slot]
@@ -2464,13 +2504,18 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
         for fut in pending:
             i = futures[fut]
             fut.cancel()
+            timeout_err = (
+                "Timed out waiting for agent (fanout deadline; "
+                "set SWARM_FANOUT_TIMEOUT or SWARM_PER_CALL_TIMEOUT)."
+            )
             results[i] = {
+                "agent_id": _spec_to_agent_id(specs[i]),
                 "model": "?",
                 "ok": False,
-                "error": (
-                    "Timed out waiting for agent (fanout deadline; "
-                    "set SWARM_FANOUT_TIMEOUT or SWARM_PER_CALL_TIMEOUT)."
-                ),
+                "error": timeout_err,
+                "error_kind": "timeout",
+                "http_status": None,
+                "error_detail": timeout_err,
                 "latency_ms": 0,
                 "response": None,
                 "text": "",
@@ -2504,43 +2549,65 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
 
 
 def _is_swarm_chat_model(requested_model) -> bool:
-    if not isinstance(requested_model, str):
-        return False
-    name = requested_model.strip().lower()
-    return name in {
-        "swarmcouncil",
-        "swarmvote",
-        "swarm/vote",
-        "swarm/fanout",
-        "swarm/pipeline",
-    }
+    """Back-compat predicate. Now delegates to the shared intent map so MLX
+    and the LM Studio gateway recognize the exact same alias set, including
+    ``swarmIntelligence`` (deprecated) which used to fall through here.
+    """
+    intent, _ = _swarm_chat_intent(requested_model)
+    return intent is not None
 
 
-def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_id: str | None = None):
-    """Run swarm fanout/vote semantics and return OpenAI-shaped chat completion."""
+def _run_swarm_chat_completion(
+    requested_model: str,
+    data: dict,
+    parent_request_id: str | None = None,
+    intent: str = "council",
+):
+    """Run swarm fanout/vote semantics and return ``(body, err, err_details)``.
+
+    See ``docs/capabilities.md`` for the contract. Intent semantics match
+    the LM Studio gateway:
+
+      ``council``   → ``SWARM_CHAT_DEFAULT_STRATEGY`` (best-of-n with judge).
+      ``fanout``    → ``"fanout"`` strategy by default (no judge ceremony).
+      ``pipeline``  → 400 redirecting the caller to ``POST /swarm/pipeline``.
+    """
+    if intent == "pipeline":
+        return None, (
+            "swarm/pipeline cannot run on /v1/chat/completions because the "
+            "OpenAI chat shape cannot carry 'stages[]'. Send your request to "
+            "POST /swarm/pipeline (with {stages: [{model, prompt_prefix}, ...], "
+            "input}) instead."
+        ), None
+
     messages = data.get("messages") or []
     if not isinstance(messages, list) or not messages:
-        return None, "messages (list) is required for swarm chat"
+        return None, "messages (list) is required for swarm chat", None
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
     common = {k: v for k, v in common.items() if v is not None}
 
     swarm_cfg = data.get("swarm") if isinstance(data.get("swarm"), dict) else {}
     models = swarm_cfg.get("models") or SWARM_CHAT_DEFAULT_MODELS
-    strategy = (swarm_cfg.get("strategy") or SWARM_CHAT_DEFAULT_STRATEGY).lower()
+    if swarm_cfg.get("strategy"):
+        strategy = swarm_cfg["strategy"].lower()
+    elif intent == "fanout":
+        strategy = "fanout"
+    else:
+        strategy = SWARM_CHAT_DEFAULT_STRATEGY.lower()
     max_parallel = swarm_cfg.get("max_parallel")
 
     if not isinstance(models, (list, str)) or not models:
-        return None, "swarm.models must be a non-empty list (or 'auto')"
+        return None, "swarm.models must be a non-empty list (or 'auto')", None
 
     models, exp_err = _expand_swarm_models(models)
     if exp_err:
-        return None, exp_err
+        return None, exp_err, None
     if not models:
         return None, (
             "swarm.models expanded to an empty set: no MLX models loaded or "
             "configured. Pass an explicit list or load/register at least one alias."
-        )
+        ), None
 
     candidates, err = _fanout(
         models,
@@ -2551,12 +2618,16 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
         route_kind="chat_swarm_vote",
     )
     if err:
-        return None, err
+        return None, err, None
 
     successes = [c for c in candidates if c["ok"] and c.get("text")]
     if not successes:
         errs = "; ".join(c.get("error") or "unknown" for c in candidates)
-        return None, f"all swarm agents failed: {errs}"
+        return (
+            None,
+            f"all swarm agents failed: {errs}",
+            _summarize_failed_candidates(candidates),
+        )
 
     winner = None
     rationale = ""
@@ -2570,6 +2641,11 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
     elif strategy == "longest":
         winner = max(successes, key=lambda c: len(c.get("text", "")))
         rationale = "longest non-empty response"
+    elif len(successes) == 1:
+        # best-of-n with a single survivor has nothing to compare; skip the
+        # judge call entirely. Same rationale as the LM Studio gateway.
+        winner = successes[0]
+        rationale = "single successful candidate; judge skipped"
     else:
         labels = [chr(ord("A") + i) for i in range(len(successes))]
         rendered = "\n\n".join(
@@ -2651,7 +2727,7 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
             "requested_model": requested_model,
         },
     }
-    return out, None
+    return out, None, None
 
 
 def _swarm_body_to_sse_response(body: dict, *, chunk_chars: int = SWARM_STREAM_CHUNK_CHARS):
@@ -2825,6 +2901,11 @@ def healthz():
             "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
             "swarm_chat_auto_tokens_loaded": sorted(_SWARM_AUTO_LOADED_TOKENS),
             "swarm_chat_auto_tokens_available": sorted(_SWARM_AUTO_AVAILABLE_TOKENS),
+            "swarm_chat_canonical": _SWARM_CHAT_CANONICAL,
+            "swarm_chat_aliases": {
+                name: {"intent": intent, "deprecated": deprecated}
+                for name, (intent, deprecated) in sorted(_SWARM_CHAT_INTENTS.items())
+            },
             "dashboard": "http://<host>:<port>/dashboard/" if _mlx_dash is not None else None,
             "model_profiles_file": MODEL_PROFILES_PATH if os.path.isfile(MODEL_PROFILES_PATH) else None,
             "mlx_per_model_admission_cap_legacy": _legacy_admission_cap or None,
@@ -2915,26 +2996,62 @@ def _handle_chat_request(data, request_headers=None):
         return _handle_grab_chat(data, dash_rid=dash_rid, request_headers=request_headers)
 
     requested = data.get("model")
-    if SWARM_CHAT_ENABLED and _is_swarm_chat_model(requested):
+    swarm_intent, swarm_canonical = (None, None)
+    if SWARM_CHAT_ENABLED:
+        swarm_intent, swarm_canonical = _swarm_chat_intent(requested)
+
+    if swarm_intent is not None:
+        # ``pipeline`` is a 400 (caller misuse), not a 502 (upstream
+        # failure) — same convention as the LM Studio gateway.
+        if swarm_intent == "pipeline":
+            _body, err_msg, _ = _run_swarm_chat_completion(
+                str(requested), data, parent_request_id=dash_rid, intent="pipeline",
+            )
+            return Response(
+                json.dumps({"error": err_msg, "redirect": "POST /swarm/pipeline"}),
+                status=400,
+                mimetype="application/json",
+            )
+
         wants_stream = data.get("stream") is True
-        body, swarm_err = _run_swarm_chat_completion(
+        body, swarm_err, swarm_err_details = _run_swarm_chat_completion(
             str(requested),
             data,
             parent_request_id=dash_rid,
+            intent=swarm_intent,
         )
         if swarm_err or not body:
+            err_body: dict = {"error": f"Swarm routing failed: {swarm_err}"}
+            if swarm_err_details:
+                err_body["error_details"] = swarm_err_details
+            err_headers: dict = {}
+            if swarm_canonical and swarm_canonical.lower() != str(requested).strip().lower():
+                err_headers["X-Swarm-Canonical-Name"] = swarm_canonical
+            if isinstance(swarm_err_details, dict):
+                kinds = swarm_err_details.get("kinds") or {}
+                if kinds:
+                    err_headers["X-Swarm-Error-Kinds"] = ",".join(
+                        f"{k}={v}" for k, v in sorted(kinds.items())
+                    )
             return Response(
-                json.dumps({"error": f"Swarm routing failed: {swarm_err}"}),
+                json.dumps(err_body),
                 status=502,
                 mimetype="application/json",
+                headers=err_headers or None,
             )
         if wants_stream:
             return _swarm_body_to_sse_response(body)
+        resp_headers = {
+            "X-Model-Routed-To": str(body.get("model", "swarm/unknown")),
+            "X-Swarm-Intent": swarm_intent,
+        }
+        if swarm_canonical and swarm_canonical.lower() != str(requested).strip().lower():
+            resp_headers["X-Swarm-Canonical-Name"] = swarm_canonical
         return Response(
             json.dumps(body),
             status=200,
             mimetype="application/json",
-            headers={"X-Model-Routed-To": str(body.get("model", "swarm/unknown"))},
+            headers=resp_headers,
         )
 
     # Anthropic escalation for big non-code tasks (matches middle_layer.py)
