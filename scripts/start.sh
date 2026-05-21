@@ -170,9 +170,16 @@ case "$PROFILE" in
     export DEFAULT_MODEL="${DEFAULT_MODEL:-$TARGET_MODEL}"
     export LM_STUDIO_URL="${LM_STUDIO_URL:-http://127.0.0.1:1234}"
     export PORT="${PORT:-5000}"
+    # Prefer LM-Studio-shaped role file (short ids) over the MLX one (long
+    # mlx-community/lmstudio-community paths) — the LM Studio gateway resolves
+    # against /v1/models which returns short ids, so substring matches in
+    # mlx_roles.json never hit and the resolver falls through to the in-code
+    # default DEFAULT_MODEL_ROLES (which can JIT-load oversize models).
     if [[ -z "${MODEL_ROLES_FILE:-}" ]]; then
-      if [[ -f "$REPO_ROOT/mlx_roles.json" ]]; then export MODEL_ROLES_FILE="$REPO_ROOT/mlx_roles.json"
-      elif [[ -f "$ws_root/mlx_roles.json" ]]; then export MODEL_ROLES_FILE="$ws_root/mlx_roles.json"
+      if   [[ -f "$REPO_ROOT/lmstudio_roles.json" ]]; then export MODEL_ROLES_FILE="$REPO_ROOT/lmstudio_roles.json"
+      elif [[ -f "$ws_root/lmstudio_roles.json" ]];  then export MODEL_ROLES_FILE="$ws_root/lmstudio_roles.json"
+      elif [[ -f "$REPO_ROOT/mlx_roles.json" ]];     then export MODEL_ROLES_FILE="$REPO_ROOT/mlx_roles.json"
+      elif [[ -f "$ws_root/mlx_roles.json" ]];       then export MODEL_ROLES_FILE="$ws_root/mlx_roles.json"
       fi
     fi
     export MAX_PARALLEL_MODEL_CALLS="${MAX_PARALLEL_MODEL_CALLS:-1}"

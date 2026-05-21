@@ -5,16 +5,20 @@ and static UI. Does not expose chain-of-thought; only routing and I/O metadata.
 
 from __future__ import annotations
 
-import os
 import json
-import time
+import logging
+import os
 import re
 import threading
-import logging
-from collections import deque, defaultdict
+import time
+from collections import defaultdict, deque
 from typing import Any
 
-from flask import Blueprint, request, Response, send_from_directory, abort, redirect
+from flask import Blueprint, Response, abort, redirect, request, send_from_directory
+
+from middle_layer.security import alias_in_allowlist as _alias_in_allowlist
+from middle_layer.security import check_api_key as _check_api_key
+from middle_layer.security import is_well_formed_alias as _is_well_formed_alias
 
 log = logging.getLogger("mlx_dashboard")
 
@@ -41,12 +45,7 @@ def configure(**kwargs: Any) -> None:
 
 def _auth_ok() -> bool:
     key = os.environ.get("MIDDLE_LAYER_API_KEY")
-    if not key:
-        return True
-    x_api_key = request.headers.get("X-API-Key")
-    authz = request.headers.get("Authorization", "")
-    bearer = authz[len("Bearer ") :] if authz.startswith("Bearer ") else None
-    return x_api_key == key or bearer == key
+    return _check_api_key(request.headers, key)
 
 
 def _require_api_auth() -> Response | None:
@@ -343,9 +342,29 @@ def api_models_load():
     if mgr is None:
         return Response(json.dumps({"error": "mlx_manager not configured"}), status=503, mimetype="application/json")
     data = request.get_json(silent=True) or {}
-    alias = (data.get("alias") or data.get("model") or "").strip()
+    raw_alias = data.get("alias") or data.get("model") or ""
+    alias = raw_alias.strip() if isinstance(raw_alias, str) else ""
     if not alias:
         return Response(json.dumps({"error": "alias required"}), status=400, mimetype="application/json")
+    if not _is_well_formed_alias(alias):
+        return Response(
+            json.dumps({"error": "alias contains disallowed characters"}),
+            status=400,
+            mimetype="application/json",
+        )
+    try:
+        available = list(mgr.get_available_aliases())
+    except Exception:
+        available = []
+    if not _alias_in_allowlist(alias, available):
+        return Response(
+            json.dumps({
+                "error": f"alias '{alias}' is not in the discovered model set",
+                "hint": "GET /dashboard/api/snapshot lists available aliases",
+            }),
+            status=400,
+            mimetype="application/json",
+        )
     h = mgr.load_model(alias)
     if h is None:
         return Response(json.dumps({"error": f"could not load '{alias}'"}), status=400, mimetype="application/json")

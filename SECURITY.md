@@ -45,13 +45,30 @@ input to them in an unsafe way.
 ## Hardening roadmap
 
 Known gaps and their remediation passes are tracked in the internal risk
-register (`docs/_internal/RISK_REGISTER.md` on the discovery branch). Highlights
-scheduled for **Pass 4**:
+register (`docs/_internal/RISK_REGISTER.md` on the discovery branch).
 
-- Constant-time API key comparison
-- Refuse public bind without API key (with explicit override)
-- Model-load allowlists and path containment for dashboard-driven loads
-- Request size limits, rate limits, security headers, CSP on the dashboard
+### Landed in Pass 4 (current `[Unreleased]`)
+
+- ✅ **Constant-time API key comparison** (`hmac.compare_digest`) across
+  both backends and the dashboard. Closes **P4-02**.
+- ✅ **Refuse public bind without API key** unless
+  `MIDDLE_LAYER_ALLOW_PUBLIC_NO_AUTH=1` is set. Closes **P4-01**.
+- ✅ **Model-load allowlist** on `/dashboard/api/models/load`:
+  syntactic filter on the alias string plus an exact-match allowlist
+  against the discovered on-disk model set. Closes **P4-03**.
+- ✅ **Request body size cap** via `MIDDLE_LAYER_MAX_REQUEST_BYTES`
+  (default 10 MiB) → Flask-native 413 on oversize bodies.
+- ✅ **Standard hardening headers** on every response
+  (`X-Content-Type-Options`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin`)
+  plus a strict **Content-Security-Policy** on the dashboard.
+
+### Still scheduled (Pass 5+)
+
+- Per-IP / per-API-key rate limiting.
+- HSTS guidance for deployments behind TLS.
+- CSP nonce-mode for the dashboard (currently allows `style-src 'unsafe-inline'`).
+- Prompt redaction (regex) when `MLX_DASHBOARD_CAPTURE_PROMPTS=1`.
 
 ## `ANTHROPIC_BASE_URL` and similar
 
