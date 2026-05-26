@@ -338,6 +338,31 @@ def api_models_load():
     denied = _require_api_auth()
     if denied:
         return denied
+    # Audit finding: in grab mode the API only serves one model, but
+    # the dashboard load endpoint would happily push extra models into
+    # the LRU — wasting RAM and confusing operators. Block in grab mode.
+    grab_mode_fn = _CTX.get("grab_mode")
+    if callable(grab_mode_fn):
+        try:
+            if grab_mode_fn():
+                return Response(
+                    json.dumps({
+                        "error": (
+                            "model loading is disabled in grab mode "
+                            "(single-model). The chat API only serves "
+                            "the grabbed model; loading extra weights "
+                            "would just waste RAM."
+                        ),
+                    }),
+                    status=400,
+                    mimetype="application/json",
+                )
+        except Exception:
+            # Conservative: if the grab-mode check itself fails, fall
+            # through and try the load. Better to attempt the load and
+            # potentially confuse the operator than to silently 500 on
+            # the check.
+            pass
     mgr = _CTX.get("mlx_manager")
     if mgr is None:
         return Response(json.dumps({"error": "mlx_manager not configured"}), status=503, mimetype="application/json")
@@ -367,7 +392,25 @@ def api_models_load():
         )
     h = mgr.load_model(alias)
     if h is None:
-        return Response(json.dumps({"error": f"could not load '{alias}'"}), status=400, mimetype="application/json")
+        # Audit finding: this used to return a generic "could not load"
+        # message even when the MLXManager had captured the underlying
+        # error in _last_load_errors (often the OOM-guided string).
+        # Surface that detail so the operator doesn't have to grep logs.
+        load_err = None
+        try:
+            getter = getattr(mgr, "get_last_load_error", None)
+            if callable(getter):
+                load_err = getter(alias)
+        except Exception:
+            load_err = None
+        return Response(
+            json.dumps({
+                "error": load_err or f"could not load '{alias}'",
+                "alias": alias,
+            }),
+            status=503 if load_err else 400,
+            mimetype="application/json",
+        )
     return Response(
         json.dumps({"ok": True, "alias": alias, "resident": mgr.get_loaded_aliases()}),
         mimetype="application/json",
