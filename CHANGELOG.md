@@ -12,6 +12,79 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Changed (LM Studio gateway: dynamic-by-default)
+
+- **`PREFER_LOADED_MODELS` default flipped from `"1"` to `"strict"`.** With
+  the legacy `"1"` (prefer-loaded with fall-through to the installed set),
+  a role/`DEFAULT_MODEL` preference whose first substring matched an
+  installed-but-not-loaded id would resolve to that id and cause LM Studio
+  to silently JIT-load a model the operator never staged — frequently a
+  giant MoE that would then evict the model they were actually using.
+  The new `"strict"` default never falls through to the installed set, so
+  resolution always lands on something LM Studio already has resident.
+  Unset environments now emit a one-shot `DeprecationWarning` explaining
+  how to pin the legacy behavior (`PREFER_LOADED_MODELS=1`). Legacy value
+  removed in 0.2.0. The `scripts/start.sh --profile lmstudio` launcher
+  already exported `strict`, so this only changes behavior for direct
+  `python middle_layer.py` invocations.
+
+### Changed (swarm chat: dynamic-by-default)
+
+- **`SWARM_CHAT_DEFAULT_MODELS` default flipped from
+  `"role:reasoner,role:coder,role:fast"` to `"auto"`.** The old default
+  fanned every default-shaped swarm chat completion out to three role
+  lookups, each of which (under the legacy `PREFER_LOADED_MODELS=1`)
+  could JIT-load a different installed model. The new `"auto"` token
+  expands to whatever LM Studio currently has resident at request time,
+  matching the launcher behavior. Unset environments emit a
+  `DeprecationWarning`; pin the legacy value via
+  `SWARM_CHAT_DEFAULT_MODELS=role:reasoner,role:coder,role:fast`. Legacy
+  value removed in 0.2.0.
+
+### Added — Swarm intelligence effectiveness pass
+
+The previous default of `SWARM_CHAT_DEFAULT_MODELS="auto"` quietly
+turned default-shaped `swarmCouncil` calls into N-way fanouts against
+every id `/v1/models` reported — including embedding models and
+installed-but-not-loaded JIT candidates. With `MAX_PARALLEL_MODEL_CALLS=2`
+that meant ~9 sequential batches per "swarm" call, no consensus, no
+diversity benefit, and one wasted slot per embedding model loaded. This
+pass turns swarm into a real swarm:
+
+- **`auto` now expands against the truly-loaded, chat-capable set.**
+  `run_swarm_chat_completion` and the LM Studio gateway's
+  `_expand_swarm_models` wrapper both now prefer
+  `get_loaded_lmstudio_model_ids` (LM Studio `/api/v0/models`,
+  `state=loaded`) over `get_lmstudio_model_ids` (installed). The result
+  is then filtered through a new `is_chat_capable_model_id` heuristic so
+  embedding models (`text-embedding-*`, `nomic-embed-*`, `bge-*`, `e5-*`,
+  …) never end up in a chat fanout. Falls back to the installed list
+  with the same chat filter when the loaded probe is unreachable.
+- **New `SWARM_CHAT_AUTO_MAX` env var (default `3`).** Caps how many
+  loaded chat ids the `auto` / `loaded` / `*` sentinels expand to, so a
+  default `swarmCouncil` against a box with 7 loaded models gives you a
+  three-way swarm, not a seven-way slow queue. Three is the sweet spot
+  for diversity-vs-cost (one reasoner + one coder + one fast); set to
+  `0` to disable the cap. The dedicated `/swarm/fanout` HTTP endpoint
+  intentionally does **not** apply this cap — callers that hit
+  `/swarm/fanout` explicitly want every candidate.
+- **`first-success` strategy now actually exits early.** `fanout` gained
+  an `early_exit_on_first_success` parameter; when the first agent
+  returns `ok=True` with non-empty text, pending peers are cancelled and
+  the result is returned immediately. Previously `first-success` waited
+  for every agent in the fanout to complete and just picked
+  `successes[0]` in input order — the same total latency as
+  `best-of-n` minus the judge call. `best-of-n` and `longest` still
+  wait-for-all because the judge / max-by-length needs every candidate.
+  `run_swarm_chat_completion` passes `early_exit=True` for both
+  `first-success` and `fanout` intents; the dedicated `/swarm/fanout`
+  HTTP endpoint always returns all candidates.
+- **Default strategy kept at `best-of-n`.** With the curated 3-model
+  default swarm and the embedding filter, the judge round-trip is no
+  longer a wasted cost on a 17-way fanout — it's an actual consensus
+  call across diverse models. Callers can still pass
+  `swarm.strategy: "first-success"` per-request for latency-over-quality.
+
 ### Pass 4 — Security hardening (this section)
 
 Closes the security debt flagged in 0.1.0 / 0.2.0 (`P4-01`, `P4-02`,

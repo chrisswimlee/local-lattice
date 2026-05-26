@@ -72,15 +72,53 @@ _cached_loaded_ids_ts = 0
 _loaded_endpoint_supported = True
 MODEL_LIST_TTL = int(os.environ.get("MODEL_LIST_TTL", "30"))
 
-# Prefer LM Studio model ids that are already loaded over not-loaded ones. When
-# this is on (default), role lookups iterate preferences against loaded ids
-# first and only fall back to the full installed set if nothing loaded matches.
-# Stops swarm fanouts from JIT-loading three different giant models in parallel
-# on a memory-tight Mac. Set PREFER_LOADED_MODELS=0 to restore the old behavior
-# (treat every installed id as equally available).
-PREFER_LOADED_MODELS = os.environ.get("PREFER_LOADED_MODELS", "1").strip().lower() not in {
-    "0", "false", "no", "off"
-}
+# Prefer LM Studio model ids that are already loaded over not-loaded ones.
+# Three modes:
+#   0 / false / no / off       — legacy: treat every installed id as equally
+#                                available; first-match-wins ordering.
+#   1 / true / yes / on        — prefer loaded ids; fall back to the installed
+#                                set if nothing loaded matches a request.
+#   strict / only / 2 (def.)   — *only* use loaded ids when LM Studio reports
+#                                at least one loaded model. Role/DEFAULT_MODEL
+#                                preferences and explicit-id requests never
+#                                fall through to the installed set, so MiddleLayer
+#                                won't silently ask LM Studio to JIT-load a
+#                                different model than the one(s) you have resident.
+#                                A request for a specific not-loaded id returns 503
+#                                (or whatever ``ON_MODEL_MISS`` says).
+#
+# Default changed in 0.1.x from "1" -> "strict" so the in-process default
+# matches the launcher (``scripts/start.sh --profile lmstudio``). Unset
+# environments emit a one-shot DeprecationWarning explaining how to pin the
+# legacy "prefer-loaded with installed fallthrough" behavior.
+_PREFER_LOADED_DEFAULT = "strict"
+_PREFER_LOADED_LEGACY_DEFAULT = "1"
+_PREFER_LOADED_ENV = os.environ.get("PREFER_LOADED_MODELS")
+if _PREFER_LOADED_ENV is None:
+    # Dynamic-by-default: stick to whatever LM Studio currently has loaded
+    # and never silently JIT-load installed-but-not-loaded ids. The old
+    # default ("1" = prefer-loaded with fall-through to the installed set)
+    # caused chat requests to JIT giant models behind the operator's back
+    # when a role/DEFAULT_MODEL preference happened to substring-match an
+    # installed id before any loaded one. AGENTS.md non-negotiable #1
+    # (deprecation path): keep the legacy default available via env var
+    # for one minor version and warn so operators can flip back.
+    warnings.warn(
+        "PREFER_LOADED_MODELS is unset: defaulting to 'strict' (was "
+        f"{_PREFER_LOADED_LEGACY_DEFAULT!r}) so MiddleLayer never JIT-loads "
+        "installed-but-not-loaded LM Studio models. Set "
+        "PREFER_LOADED_MODELS=1 explicitly to keep the legacy prefer-loaded "
+        "behavior; will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    _PREFER_LOADED_RAW = _PREFER_LOADED_DEFAULT
+else:
+    _PREFER_LOADED_RAW = _PREFER_LOADED_ENV.strip().lower()
+_PREFER_LOADED_STRICT_TOKENS = {"strict", "only", "2", "loaded-only", "loaded_only"}
+_PREFER_LOADED_OFF_TOKENS = {"0", "false", "no", "off"}
+PREFER_LOADED_MODELS = _PREFER_LOADED_RAW not in _PREFER_LOADED_OFF_TOKENS
+STRICT_LOADED_MODELS = _PREFER_LOADED_RAW in _PREFER_LOADED_STRICT_TOKENS
 
 # Tokens that mean "you pick a model for me". OpenClaw-specific ids are gated
 # behind EXTRA_PLACEHOLDER_MODELS (see middle_layerMLX.py for the shared policy).
@@ -374,6 +412,50 @@ def get_loaded_lmstudio_model_ids(force_refresh: bool = False):
     return list(deduped), None
 
 
+# Heuristic for filtering embedding / non-chat-capable model ids out of
+# swarm fanouts. LM Studio's /api/v0/models *does* carry a ``type`` field
+# (``llm``/``vlm``/``embeddings``), but the older ``/v1/models`` endpoint
+# doesn't, and we want this filter to work regardless of which probe the
+# loaded-ids list came from. Matches the common embedding-model naming
+# conventions we see on LM Studio (``text-embedding-...``,
+# ``nomic-embed-...``, ``bge-...``, ``e5-...``, anything with a literal
+# ``embed`` token in its id segment). Erring on the side of false positives
+# is acceptable here — operators can always pass an explicit
+# ``swarm.models`` list to bypass the filter.
+_EMBED_ID_HINT = re.compile(
+    r"(?ix) (?:^|[/_-]) (?:embed|embedding|embeddings|nomic-embed|bge|e5) (?:[/_-]|$)"
+)
+
+
+def is_chat_capable_model_id(model_id) -> bool:
+    """Best-effort guess at whether a loaded LM Studio model id can serve
+    ``/v1/chat/completions``. Used by the ``auto``-expansion of
+    ``SWARM_CHAT_DEFAULT_MODELS`` so swarm fanouts don't waste a slot on
+    embedding models (which return 400 for chat completions and would just
+    increment the failure column).
+    """
+    if not isinstance(model_id, str):
+        return False
+    return _EMBED_ID_HINT.search(model_id) is None
+
+
+# Back-compat alias for callers that imported the underscore-prefixed name.
+_is_chat_capable_model_id = is_chat_capable_model_id
+
+
+def get_loaded_chat_capable_lmstudio_model_ids(force_refresh: bool = False):
+    """Loaded-ids list filtered to chat-capable ids only. Pairs with
+    ``get_loaded_lmstudio_model_ids`` (which returns *all* loaded ids,
+    including embedding models). Used by swarm ``auto`` expansion so a
+    default-shaped ``swarmCouncil`` call against a box that also has an
+    embedding model loaded doesn't fan out to that embedding model.
+    """
+    ids, err = get_loaded_lmstudio_model_ids(force_refresh=force_refresh)
+    if err:
+        return ids, err
+    return [m for m in ids if is_chat_capable_model_id(m)], None
+
+
 def get_current_lmstudio_model():
     """
     Backwards-compatible single-model accessor. Returns (model_id, error)
@@ -425,6 +507,10 @@ def _resolve_role(role: str, available, loaded=None):
     ``available`` set (which on LM Studio includes downloaded-but-not-loaded
     ids that would JIT-load on first call). This stops swarm fanouts from
     JIT-loading three different giant models in parallel and OOMing.
+
+    When ``STRICT_LOADED_MODELS`` is on AND ``loaded`` is non-empty, the
+    fall-through is suppressed entirely — a role miss returns ``None`` rather
+    than JIT-loading something the operator didn't explicitly stage.
     """
     prefs = MODEL_ROLES.get(role.lower(), [])
     if isinstance(prefs, str):
@@ -434,6 +520,8 @@ def _resolve_role(role: str, available, loaded=None):
             m = _match_one(p, loaded)
             if m:
                 return m
+        if STRICT_LOADED_MODELS:
+            return None
     for p in prefs:
         m = _match_one(p, available)
         if m:
@@ -473,21 +561,33 @@ def resolve_model_id(requested, available=None, loaded=None):
         loaded, _lerr = get_loaded_lmstudio_model_ids()
         # _lerr is non-fatal: on probe failure we just proceed against `available`.
 
+    # In strict mode, once LM Studio reports at least one loaded model we
+    # *only* resolve against that set. The installed-but-not-loaded set is
+    # what LM Studio would JIT-load behind the user's back, which is exactly
+    # the behavior STRICT_LOADED_MODELS is meant to disable.
+    strict = STRICT_LOADED_MODELS and bool(loaded)
+
     if _is_placeholder(requested):
         if DEFAULT_MODEL:
             if PREFER_LOADED_MODELS and loaded:
                 m = _match_one(DEFAULT_MODEL, loaded)
                 if m:
                     return m, None
-            m = _match_one(DEFAULT_MODEL, available)
-            if m:
-                return m, None
+            if not strict:
+                m = _match_one(DEFAULT_MODEL, available)
+                if m:
+                    return m, None
         # Try the "default" role next, then first loaded id, then first available.
         m = _resolve_role("default", available, loaded=loaded)
         if m:
             return m, None
         if PREFER_LOADED_MODELS and loaded:
             return loaded[0], None
+        if strict:
+            # Defensive — bool(loaded) implies non-empty so we already
+            # returned above, but keep the guard so future edits can't sneak
+            # an installed-set fallthrough past us.
+            return None, "STRICT_LOADED_MODELS: no loaded LM Studio model available"
         return available[0], None
 
     candidates = [c.strip() for c in str(requested).split(",") if c.strip()]
@@ -504,6 +604,11 @@ def resolve_model_id(requested, available=None, loaded=None):
             m = _match_one(needle, loaded)
             if m:
                 return m, None
+        if strict:
+            return None, (
+                f"STRICT_LOADED_MODELS: '{requested}' did not match any "
+                f"loaded LM Studio model. Loaded: {loaded}"
+            )
     # Second pass: full available set (allows JIT-load of installed ids).
     for cand in candidates:
         cand_lc = cand.lower()
@@ -744,6 +849,7 @@ def healthz():
                 "model_roles": MODEL_ROLES,
                 "model_roles_source": MODEL_ROLES_SOURCE,
                 "prefer_loaded_models": bool(PREFER_LOADED_MODELS),
+                "strict_loaded_models": bool(STRICT_LOADED_MODELS),
                 "default_model": DEFAULT_MODEL or None,
                 "max_parallel": MAX_PARALLEL_MODEL_CALLS,
                 "per_model_inflight_cap": LM_STUDIO_PER_MODEL_INFLIGHT_CAP,
@@ -957,7 +1063,13 @@ def proxy(endpoint):
                 # If the caller asked for a specific model that is not loaded,
                 # either fall back (default) or surface the error.
                 if not _is_placeholder(requested) and ON_MODEL_MISS == "fallback":
-                    fb_ids, fb_err = get_lmstudio_model_ids()
+                    # Under STRICT_LOADED_MODELS, fall back only to a loaded
+                    # id so the proxy never silently asks LM Studio to JIT a
+                    # different installed model.
+                    if STRICT_LOADED_MODELS:
+                        fb_ids, fb_err = get_loaded_lmstudio_model_ids()
+                    else:
+                        fb_ids, fb_err = get_lmstudio_model_ids()
                     if not fb_err and fb_ids:
                         model_id = fb_ids[0]
                         fallback_from = requested
@@ -1129,18 +1241,40 @@ from middle_layer.swarm import (  # noqa: E402
     _is_auto_swarm_token,
 )
 from middle_layer.swarm import expand_swarm_models as _swarm_expand_models  # noqa: E402
+from middle_layer.swarm import SWARM_CHAT_AUTO_MAX as _SWARM_CHAT_AUTO_MAX  # noqa: E402
 
 
-def _expand_swarm_models(spec, available=None):
+def _swarm_auto_pool():
+    """Loaded-and-chat-capable pool used by swarm ``auto``/``loaded``/``*``
+    sentinels. Tries the truly-loaded probe (``/api/v0/models``) first and
+    filters out embedding models; falls back to the installed list
+    (``/v1/models``, with the same chat-capable filter) when the loaded
+    probe isn't reachable (older LM Studio, network blip, …).
+    """
+    loaded, err = get_loaded_chat_capable_lmstudio_model_ids()
+    if not err and loaded:
+        return loaded, None
+    installed, ierr = get_lmstudio_model_ids()
+    if ierr:
+        return [], err or ierr
+    return [m for m in installed if is_chat_capable_model_id(m)], None
+
+
+def _expand_swarm_models(spec, available=None, *, apply_auto_cap: bool = False):
     """Thin gateway wrapper around ``middle_layer.swarm.expand_swarm_models``
     that wires in the LM Studio loaded-models probe so sentinel tokens
     (``auto`` / ``loaded`` / ``*`` / ``all`` / ``all-loaded``) can resolve
-    against the actual LM Studio inventory.
+    against the actual LM Studio inventory, filtered to chat-capable ids
+    only. ``apply_auto_cap`` is opt-in: callers that want the
+    ``SWARM_CHAT_AUTO_MAX`` cap (default swarm chat completions) set it;
+    the dedicated ``/swarm/fanout`` HTTP endpoint leaves it off so explicit
+    ``models: "auto"`` callers still get every loaded chat model.
     """
     return _swarm_expand_models(
         spec,
         available=available,
-        fetch_loaded=get_lmstudio_model_ids,
+        fetch_loaded=_swarm_auto_pool,
+        max_auto_entries=_SWARM_CHAT_AUTO_MAX if apply_auto_cap else None,
     )
 
 
@@ -1564,6 +1698,16 @@ def main() -> None:
         print("Auth: disabled (set MIDDLE_LAYER_API_KEY to enable)")
 
     print(f"Model miss policy: {ON_MODEL_MISS}")
+    if STRICT_LOADED_MODELS:
+        print(
+            "Loaded-model policy: STRICT (PREFER_LOADED_MODELS=strict) — "
+            "MiddleLayer will only use LM Studio's currently-loaded models; "
+            "role/DEFAULT_MODEL preferences never JIT-load installed-but-not-loaded ids."
+        )
+    elif PREFER_LOADED_MODELS:
+        print("Loaded-model policy: prefer-loaded (fall back to installed set if no loaded match)")
+    else:
+        print("Loaded-model policy: legacy (no preference for loaded ids; first-match wins)")
     print(f"Max parallel model calls (swarm): {MAX_PARALLEL_MODEL_CALLS}")
     if _litellm_available():
         print("LiteLLM: available")

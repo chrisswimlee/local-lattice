@@ -166,10 +166,24 @@ case "$PROFILE" in
       echo "middle_layer_venv not found under $ws_root or $REPO_ROOT" >&2
       exit 1
     fi
-    export TARGET_MODEL="${TARGET_MODEL:-qwen/qwen3.5-35b-a3b}"
+    # Dynamic-by-default: don't pin TARGET_MODEL/DEFAULT_MODEL to a specific id
+    # so MiddleLayer picks whatever LM Studio currently has loaded. Operators
+    # who want a specific default can still export TARGET_MODEL / DEFAULT_MODEL
+    # before running this script.
+    export TARGET_MODEL="${TARGET_MODEL:-}"
     export DEFAULT_MODEL="${DEFAULT_MODEL:-$TARGET_MODEL}"
     export LM_STUDIO_URL="${LM_STUDIO_URL:-http://127.0.0.1:1234}"
     export PORT="${PORT:-5000}"
+    # Refuse to JIT-load installed-but-not-loaded models. With this set,
+    # roles, DEFAULT_MODEL, and swarm fanouts only ever pick from LM Studio's
+    # currently-loaded set. Set PREFER_LOADED_MODELS=1 (or 0) to disable.
+    export PREFER_LOADED_MODELS="${PREFER_LOADED_MODELS:-strict}"
+    # Default the swarm fanout to whatever's loaded ("auto" expands to the
+    # current loaded set at request time) so swarmCouncil / swarmIntelligence
+    # never tries to spin up role:reasoner+role:coder+role:fast as three
+    # separate JIT loads.
+    export SWARM_CHAT_DEFAULT_MODELS="${SWARM_CHAT_DEFAULT_MODELS:-auto}"
+    export SWARM_CHAT_DEFAULT_STRATEGY="${SWARM_CHAT_DEFAULT_STRATEGY:-first-success}"
     # Prefer LM-Studio-shaped role file (short ids) over the MLX one (long
     # mlx-community/lmstudio-community paths) — the LM Studio gateway resolves
     # against /v1/models which returns short ids, so substring matches in
@@ -183,8 +197,6 @@ case "$PROFILE" in
       fi
     fi
     export MAX_PARALLEL_MODEL_CALLS="${MAX_PARALLEL_MODEL_CALLS:-1}"
-    export SWARM_CHAT_DEFAULT_MODELS="${SWARM_CHAT_DEFAULT_MODELS:-role:fast}"
-    export SWARM_CHAT_DEFAULT_STRATEGY="${SWARM_CHAT_DEFAULT_STRATEGY:-first-success}"
     echo "MiddleLayer (profile=lmstudio) — PORT=$PORT LM_STUDIO_URL=$LM_STUDIO_URL"
     if command -v local-lattice-lmstudio >/dev/null 2>&1; then
       exec local-lattice-lmstudio "${FORWARD[@]}"
