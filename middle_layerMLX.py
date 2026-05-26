@@ -186,7 +186,26 @@ MIDDLE_LAYER_API_KEY = os.environ.get("MIDDLE_LAYER_API_KEY")
 # MLX residency / concurrency
 MAX_CONCURRENT_MODELS = int(os.environ.get("MAX_CONCURRENT_MODELS", "2"))
 PRELOAD_MODELS = [s.strip() for s in os.environ.get("PRELOAD_MODELS", "").split(",") if s.strip()]
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))  # Flask threads via app.run(threaded=True)
+
+# Historical knob. Was advertised as "Flask threads" but never wired —
+# ``app.run(host, port, threaded=True)`` doesn't take a worker cap, and
+# this value was only logged. Real production concurrency is a job for
+# the upstream WSGI server. Kept for one minor as a no-op with a
+# ``DeprecationWarning`` when explicitly set, per AGENTS.md rule 1.
+_MAX_WORKERS_ENV = os.environ.get("MAX_WORKERS")
+if _MAX_WORKERS_ENV is not None:
+    warnings.warn(
+        "MAX_WORKERS is no longer honored: Flask's threaded=True does not "
+        "take a worker cap, and this knob was only logged. Configure your "
+        "upstream WSGI server (gunicorn --workers, uvicorn --workers, etc.) "
+        "instead. The env var is ignored and will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+# Kept as a module-level symbol so any downstream import (notably the
+# legacy startup banner) doesn't NameError mid-deprecation. Always 0
+# (== "no in-process cap"). Do not read this for any new logic.
+MAX_WORKERS = 0
 
 # Swarm / multi-agent knobs
 MAX_PARALLEL_MODEL_CALLS = int(os.environ.get("MAX_PARALLEL_MODEL_CALLS", "2"))
@@ -226,11 +245,44 @@ MLX_CONTEXT_TRIM_BUFFER = int(os.environ.get("MLX_CONTEXT_TRIM_BUFFER", "8"))
 # Rough pre-resolve prompt size for routing (chars / ratio ≈ tokens).
 MLX_ROUTE_LONG_PROMPT_CHARS = int(os.environ.get("MLX_ROUTE_LONG_PROMPT_CHARS", "48000"))
 
-# Per-model in-flight generation cap. Keep MLX_PER_MODEL_ADMISSION_CAP for backwards compatibility.
-_legacy_admission_cap = int(os.environ.get("MLX_PER_MODEL_ADMISSION_CAP", "0"))
-MLX_PER_MODEL_INFLIGHT_CAP = int(
-    os.environ.get("MLX_PER_MODEL_INFLIGHT_CAP", str(_legacy_admission_cap))
-)
+# Per-model in-flight generation cap. Default changed in 0.1.x from 0
+# (admission scheduler bypassed entirely) to 1 (one inference per alias,
+# match the stable launcher). Direct ``python middle_layerMLX.py``
+# invocations now get back-pressure by default instead of unbounded
+# thread pile-up on ``gen_lock``. AGENTS.md rule 1: emit a one-shot
+# ``DeprecationWarning`` when unset so operators can pin the legacy
+# behavior with ``MLX_PER_MODEL_INFLIGHT_CAP=0``.
+#
+# ``MLX_PER_MODEL_ADMISSION_CAP`` is the historical name; honored as a
+# fallback for one minor with a separate warning.
+_legacy_admission_cap_raw = os.environ.get("MLX_PER_MODEL_ADMISSION_CAP")
+if _legacy_admission_cap_raw is not None:
+    warnings.warn(
+        "MLX_PER_MODEL_ADMISSION_CAP is deprecated; use "
+        "MLX_PER_MODEL_INFLIGHT_CAP. Honored as a fallback for now; "
+        "will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+_legacy_admission_cap = int(_legacy_admission_cap_raw or "0")
+
+_inflight_cap_env = os.environ.get("MLX_PER_MODEL_INFLIGHT_CAP")
+if _inflight_cap_env is None and _legacy_admission_cap_raw is None:
+    warnings.warn(
+        "MLX_PER_MODEL_INFLIGHT_CAP is unset: defaulting to 1 (was 0). "
+        "MLX gateway now applies per-alias admission control by default "
+        "so direct invocations get the same back-pressure as the stable "
+        "launcher. Set MLX_PER_MODEL_INFLIGHT_CAP=0 explicitly to keep "
+        "the legacy 'no admission, rely only on gen_lock' behavior; "
+        "will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    MLX_PER_MODEL_INFLIGHT_CAP = 1
+elif _inflight_cap_env is None:
+    MLX_PER_MODEL_INFLIGHT_CAP = _legacy_admission_cap
+else:
+    MLX_PER_MODEL_INFLIGHT_CAP = int(_inflight_cap_env)
 MLX_QUEUE_MAX_PER_MODEL = int(os.environ.get("MLX_QUEUE_MAX_PER_MODEL", "32"))
 MLX_QUEUE_MAX_TOTAL = int(os.environ.get("MLX_QUEUE_MAX_TOTAL", "128"))
 MLX_QUEUE_WAIT_TIMEOUT_SEC = float(os.environ.get("MLX_QUEUE_WAIT_TIMEOUT_SEC", "20"))
@@ -886,7 +938,7 @@ def _mlx_load_model(path: str):
 _MLX_OOM_HINT = (
     "Detected probable memory pressure. Try the stable launcher "
     "(./start_middle_layerMLX_5001_stable.sh) or lower MAX_CONCURRENT_MODELS, "
-    "MAX_WORKERS, and max_tokens."
+    "MLX_PER_MODEL_INFLIGHT_CAP, and max_tokens."
 )
 
 
@@ -4149,8 +4201,42 @@ def _build_cli() -> argparse.ArgumentParser:
     return p
 
 
+def _validate_boot_knobs() -> None:
+    """Fail fast on invalid knob values before we start touching MLX.
+
+    The historical defaults silently produced runtime crashes (e.g.
+    MAX_CONCURRENT_MODELS=0 → KeyError on the first load because
+    ``OrderedDict.popitem(last=False)`` was called on an empty dict
+    inside ``_ensure_capacity_locked``). Surfacing those at startup
+    with a clear, actionable message is strictly better than waiting
+    for the first chat request to crash with a confusing traceback.
+    """
+    if MAX_CONCURRENT_MODELS < 1:
+        raise SystemExit(
+            f"MAX_CONCURRENT_MODELS={MAX_CONCURRENT_MODELS} is invalid: "
+            "must be >= 1 (the LRU eviction loop requires at least one "
+            "resident slot). Set MAX_CONCURRENT_MODELS to 1 or higher "
+            "and restart."
+        )
+    if MAX_PARALLEL_MODEL_CALLS < 1:
+        raise SystemExit(
+            f"MAX_PARALLEL_MODEL_CALLS={MAX_PARALLEL_MODEL_CALLS} is invalid: "
+            "must be >= 1 (swarm fanout requires at least one worker). "
+            "Set MAX_PARALLEL_MODEL_CALLS to 1 or higher and restart."
+        )
+    if MLX_PER_MODEL_INFLIGHT_CAP < 0:
+        raise SystemExit(
+            f"MLX_PER_MODEL_INFLIGHT_CAP={MLX_PER_MODEL_INFLIGHT_CAP} is "
+            "invalid: must be >= 0 (0 disables admission, 1+ caps "
+            "concurrent inferences per alias). Set to 0 to disable "
+            "admission or 1+ to enable and restart."
+        )
+
+
 def main():
     global MLX_MODEL_ROOT, mlx_manager, DEFAULT_MODEL
+
+    _validate_boot_knobs()
 
     parser = _build_cli()
     args = parser.parse_args()

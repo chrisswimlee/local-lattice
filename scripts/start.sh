@@ -101,7 +101,6 @@ case "$PROFILE" in
       safe)
         : "${MAX_CONCURRENT_MODELS:=1}"
         : "${MAX_PARALLEL_MODEL_CALLS:=1}"
-        : "${MAX_WORKERS:=1}"
         : "${MLX_PER_MODEL_INFLIGHT_CAP:=1}"
         : "${MLX_QUEUE_MAX_PER_MODEL:=8}"
         : "${MLX_QUEUE_MAX_TOTAL:=16}"
@@ -111,7 +110,6 @@ case "$PROFILE" in
       balanced)
         : "${MAX_CONCURRENT_MODELS:=1}"
         : "${MAX_PARALLEL_MODEL_CALLS:=2}"
-        : "${MAX_WORKERS:=2}"
         : "${MLX_PER_MODEL_INFLIGHT_CAP:=1}"
         : "${MLX_QUEUE_MAX_PER_MODEL:=12}"
         : "${MLX_QUEUE_MAX_TOTAL:=24}"
@@ -121,7 +119,6 @@ case "$PROFILE" in
       faster)
         : "${MAX_CONCURRENT_MODELS:=1}"
         : "${MAX_PARALLEL_MODEL_CALLS:=2}"
-        : "${MAX_WORKERS:=2}"
         : "${MLX_PER_MODEL_INFLIGHT_CAP:=1}"
         : "${MLX_QUEUE_MAX_PER_MODEL:=16}"
         : "${MLX_QUEUE_MAX_TOTAL:=32}"
@@ -129,7 +126,7 @@ case "$PROFILE" in
         : "${MAX_TOKENS_CEILING:=4096}"
         ;;
     esac
-    export MAX_CONCURRENT_MODELS MAX_PARALLEL_MODEL_CALLS MAX_WORKERS
+    export MAX_CONCURRENT_MODELS MAX_PARALLEL_MODEL_CALLS
     export MLX_PER_MODEL_INFLIGHT_CAP MLX_QUEUE_MAX_PER_MODEL MLX_QUEUE_MAX_TOTAL
     export DEFAULT_MAX_TOKENS MAX_TOKENS_CEILING
     export MLX_QUEUE_WAIT_TIMEOUT_SEC="${MLX_QUEUE_WAIT_TIMEOUT_SEC:-20}"

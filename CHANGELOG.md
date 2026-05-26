@@ -12,6 +12,40 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Changed (MLX gateway: boot validation + admission default flip)
+
+Closes the audit findings on boot-time correctness gaps and the
+admission scheduler being silently bypassed by default. AGENTS.md
+rule 1: every env-var default change ships with a one-shot
+`DeprecationWarning` so operators can pin the legacy behavior.
+
+- **`MAX_CONCURRENT_MODELS` is now validated at startup.** `=0` used
+  to `KeyError` on the first load because `_ensure_capacity_locked`
+  called `OrderedDict.popitem(last=False)` on an empty dict. Now
+  fails fast with an actionable message. Same validation for
+  `MAX_PARALLEL_MODEL_CALLS` (must be >= 1) and
+  `MLX_PER_MODEL_INFLIGHT_CAP` (must be >= 0).
+- **`MLX_PER_MODEL_INFLIGHT_CAP` default flipped from `0` to `1`.**
+  The legacy default disabled the admission scheduler entirely, so
+  direct `python middle_layerMLX.py` invocations had no per-alias
+  back-pressure beyond `gen_lock`'s implicit thread pile-up. New
+  default matches the stable launcher. Unset emits a one-shot
+  `DeprecationWarning`; pin the legacy behavior via
+  `MLX_PER_MODEL_INFLIGHT_CAP=0`.
+- **`MLX_PER_MODEL_ADMISSION_CAP` (historical name) honored with
+  `DeprecationWarning`.** Now folded into the standard env-var
+  fallback chain.
+- **`MAX_WORKERS` deprecated and ignored.** Was logged as "Flask
+  threads" but never wired — `app.run(threaded=True)` doesn't take
+  a worker cap. Setting it now emits a `DeprecationWarning` pointing
+  operators to upstream WSGI server config. The legacy default of
+  `MAX_WORKERS=1` in the stable launcher is removed.
+
+Tests: 10 new tests in `tests/test_mlx_boot.py` covering validation
+rejections, default-flip with deprecation, legacy alias fallback,
+and `MAX_WORKERS` warn-on-explicit-set behavior. All tests use a
+subprocess harness so MLX init never leaks into the pytest process.
+
 ### Changed (LM Studio gateway: dynamic-by-default)
 
 - **`PREFER_LOADED_MODELS` default flipped from `"1"` to `"strict"`.** With
