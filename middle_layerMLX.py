@@ -1435,9 +1435,23 @@ def init_mlx_grab_model() -> str | None:
         dest = os.path.join(cache_root, local_name)
         os.makedirs(dest, exist_ok=True)
         log.info("MLX_GRAB_MODEL: downloading %r -> %s", spec, dest)
-        snapshot_download(repo_id=spec, local_dir=dest, local_dir_use_symlinks=False)
+        # Audit finding: snapshot_download exceptions used to propagate
+        # as raw tracebacks. Now caught and surfaced as a clean error
+        # string with a hint to delete the partial download and retry.
+        try:
+            snapshot_download(repo_id=spec, local_dir=dest, local_dir_use_symlinks=False)
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"Hugging Face download failed for {spec!r}: {e}. "
+                f"Partial files may remain under {dest}; delete that "
+                "directory and retry, or check network/credentials."
+            )
         if not os.path.isfile(os.path.join(dest, "config.json")):
-            return f"Download finished but config.json missing under {dest}"
+            return (
+                f"Hugging Face download completed for {spec!r} but "
+                f"config.json is missing under {dest}. The repo may "
+                "not contain a self-contained MLX model layout."
+            )
         path = os.path.abspath(dest)
     else:
         return (
@@ -4425,7 +4439,12 @@ def _preload_and_validate(aliases_to_preload: list[str]):
 
 
 def _download_model(repo_id: str) -> int:
-    """Download a Hugging Face model and exit."""
+    """Download a Hugging Face model and exit.
+
+    Returns a process exit code: 0 on success, 1 on any failure
+    (missing huggingface_hub, network error, partial download).
+    Audit finding: failures used to surface as raw tracebacks.
+    """
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -4439,9 +4458,25 @@ def _download_model(repo_id: str) -> int:
     dest = os.path.join(cache_root, local_name)
     os.makedirs(dest, exist_ok=True)
     log.info("Downloading %r -> %s", repo_id, dest)
-    snapshot_download(repo_id=repo_id, local_dir=dest, local_dir_use_symlinks=False)
+    try:
+        snapshot_download(repo_id=repo_id, local_dir=dest, local_dir_use_symlinks=False)
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "Hugging Face download failed for %r: %s. Partial files may "
+            "remain under %s; delete that directory and retry, or check "
+            "network/credentials.",
+            repo_id,
+            e,
+            dest,
+        )
+        return 1
     if not os.path.isfile(os.path.join(dest, "config.json")):
-        log.error("Download finished but config.json missing under %s", dest)
+        log.error(
+            "Download completed for %r but config.json is missing under %s. "
+            "The repo may not contain a self-contained MLX model layout.",
+            repo_id,
+            dest,
+        )
         return 1
     log.info("Download complete: %s", dest)
     log.info("Serve with: python middle_layerMLX.py serve --grab %s", dest)

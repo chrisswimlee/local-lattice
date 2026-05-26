@@ -12,6 +12,32 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Fixed (MLX gateway: graceful HF downloads + grab/dashboard exclusion)
+
+Three operator-facing safety gaps from the audit:
+
+- `init_mlx_grab_model()` and `_download_model()` (the `download`
+  CLI subcommand) let `huggingface_hub.snapshot_download` exceptions
+  surface as raw tracebacks. Now wrapped in `try/except` with clean
+  error strings, non-zero exit codes, and a partial-download hint
+  pointing operators to delete-and-retry. The "config.json missing"
+  case also gets a clearer message about MLX layout requirements.
+- Dashboard `POST /dashboard/api/models/load` was not aware of grab
+  mode: it would happily push extra models into the LRU even though
+  the chat API only serves the grabbed model, wasting RAM. Now
+  returns 400 with a "model loading is disabled in grab mode" error.
+- Dashboard `POST /dashboard/api/models/load` used to drop the
+  `MLXManager.get_last_load_error()` detail and return a generic
+  `"could not load '<alias>'"` message. Now surfaces the full
+  guided string (which already includes the OOM remediation hint
+  when applicable) as a 503 with `error` set to the guided text.
+
+Tests: 5 new tests in `tests/test_mlx_grab.py` covering grab init
+HF failure → clean error string, grab init missing-config-after-
+download error message, `download` subcommand failure → exit code 1,
+dashboard load blocked in grab mode, dashboard load surfaces guided
+error detail.
+
 ### Performance (MLX gateway: explicit Metal cache teardown after eviction)
 
 Closes the audit finding that eviction was registry-only: dropping the
