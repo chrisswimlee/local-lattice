@@ -1101,6 +1101,10 @@ class MLXManager:
         self._registry_lock = threading.Lock()
         self._loading_locks: dict[str, threading.Lock] = {}
         self._last_load_errors: dict[str, str] = {}
+        # Timestamp (epoch seconds) of each entry in ``_last_load_errors``
+        # so /healthz can show operators when a failure happened
+        # without log-grep. Cleared in lockstep with ``_last_load_errors``.
+        self._last_load_error_ts: dict[str, int] = {}
         # Per-alias inflight refcount. Incremented by
         # ``acquire_inference_handle`` on entry, decremented on exit.
         # Protected by ``_registry_lock``.
@@ -1163,12 +1167,32 @@ class MLXManager:
         with self._registry_lock:
             return self._last_load_errors.get(alias)
 
+    def get_recent_load_errors(self) -> dict[str, dict]:
+        """Return a snapshot of every alias with a sticky load error
+        (set by the most recent failed ``load_model`` and cleared on
+        successful load or explicit unload). Used by ``/healthz`` and
+        the dashboard snapshot so operators can see ``alias X failed
+        to load 3 hours ago`` without log grep.
+
+        Returns ``{alias: {"error": str, "ts": int}}`` keyed by alias,
+        with epoch-second timestamps. Empty dict when nothing has failed.
+        """
+        with self._registry_lock:
+            return {
+                alias: {
+                    "error": self._last_load_errors[alias],
+                    "ts": self._last_load_error_ts.get(alias, 0),
+                }
+                for alias in self._last_load_errors
+            }
+
     def get_memory_stats(self):
         with self._registry_lock:
             return {
                 "loaded": list(self.loaded_models.keys()),
                 "count": len(self.loaded_models),
                 "max": MAX_CONCURRENT_MODELS,
+                "recent_load_errors_count": len(self._last_load_errors),
             }
 
     # ---------- loading (thread-safe) ------------------------------------
@@ -1251,6 +1275,7 @@ class MLXManager:
         """
         with self._registry_lock:
             self._last_load_errors.pop(alias, None)
+            self._last_load_error_ts.pop(alias, None)
             if alias not in self.loaded_models:
                 return {"unloaded": False, "deferred": False}
             if self._inflight.get(alias, 0) > 0:
@@ -1368,6 +1393,7 @@ class MLXManager:
                 err = _mlx_error_with_guidance(e, f"Failed to load MLX model '{alias}'")
                 with self._registry_lock:
                     self._last_load_errors[alias] = err
+                    self._last_load_error_ts[alias] = int(time.time())
                 log.error("%s", err)
                 return None
 
@@ -1376,6 +1402,7 @@ class MLXManager:
                 gen_lock = threading.Lock()
                 self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
                 self._last_load_errors.pop(alias, None)
+                self._last_load_error_ts.pop(alias, None)
             # Drain Metal cleanup for anything evicted during
             # _ensure_capacity_locked, outside the lock.
             self._drain_post_evict_cleanup(reason="lru-eviction")
@@ -1691,6 +1718,15 @@ def _handle_grab_chat(data: dict, dash_rid: str | None = None, request_headers=N
                 # here would be dead code. All real generation failures
                 # land in this Exception branch.
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                log.warning(
+                    "MLX (grab) generation failed: label=%s request_id=%s "
+                    "exc_type=%s elapsed_ms=%d msg=%s",
+                    label,
+                    dash_rid,
+                    type(e).__name__,
+                    elapsed,
+                    str(e)[:200],
+                )
                 if _mlx_dash is not None:
                     _mlx_dash.record_event(
                         request_id=dash_rid,
@@ -3226,6 +3262,12 @@ def healthz():
                 "safely cancelled mid-generation. Use per-request max_tokens "
                 "as the real budget control."
             ),
+            # Sticky map of "alias X failed to load" entries, populated
+            # by MLXManager.load_model on failure and cleared on
+            # subsequent successful load or explicit unload. Lets
+            # operators diagnose "why isn't model Y serving requests?"
+            # from /healthz alone instead of grep-ing logs.
+            "recent_load_errors": mlx_manager.get_recent_load_errors(),
             "admission": _admission_scheduler.snapshot(),
         }),
         status=200 if ok else 503,
@@ -3722,6 +3764,22 @@ def _handle_chat_request(data, request_headers=None):
                 # (mlx_lm generation is not safely cancellable
                 # mid-flight). All real generation failures land here.
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                # Audit finding: non-stream generation failures used to
+                # return 500 to the client with no server-side log line
+                # (only dashboard record_event). If the dashboard isn't
+                # enabled, the operator had no signal from logs alone.
+                # Log at WARNING with alias + request_id BEFORE the
+                # response is built so the line is always emitted even
+                # if dashboard recording itself fails.
+                log.warning(
+                    "MLX generation failed: alias=%s request_id=%s "
+                    "exc_type=%s elapsed_ms=%d msg=%s",
+                    alias,
+                    dash_rid,
+                    type(e).__name__,
+                    elapsed,
+                    str(e)[:200],
+                )
                 if _mlx_dash is not None:
                     _mlx_dash.record_event(
                         request_id=dash_rid,
