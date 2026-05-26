@@ -73,6 +73,7 @@ import uuid
 import logging
 import threading
 import argparse
+import contextlib
 import requests
 import copy
 import heapq
@@ -1000,11 +1001,25 @@ class MLXManager:
     `loaded_models[alias]` -> (model, tokenizer, gen_lock, last_used).
 
     Concurrency rules:
-      * `_registry_lock` protects the OrderedDict (eviction, insert, lookup).
+      * `_registry_lock` protects the OrderedDict (eviction, insert, lookup),
+        the per-alias inflight refcount, and the deferred-unload set.
       * Each model has its own `gen_lock`; callers MUST hold it while running
         `mlx_lm.generate` / `mlx_lm.stream_generate` on that model.
       * Per-alias `_loading_locks[alias]` prevents two threads from loading
-        the same model concurrently.
+        the same model concurrently. Pruned on unload + when inflight==0.
+
+    In-flight pinning (added in the swarm-intelligence-effectiveness +
+    audit hardening pass):
+      * Every inference site MUST go through ``acquire_inference_handle``
+        (the context manager) instead of calling ``load_model`` directly.
+        That increments an inflight refcount for the alias.
+      * ``_ensure_capacity_locked`` skips pinned aliases when picking an
+        eviction victim, so an LRU eviction never yanks a model out from
+        under a running generation. (If *every* resident alias is pinned,
+        a new load proceeds anyway and logs a warning — exceeding the
+        configured cap is preferred to deadlocking the caller.)
+      * ``unload_model`` is pin-aware: if the alias is in-flight, the
+        unload is *deferred* and fires when the last holder releases.
     """
 
     def __init__(self, root_path):
@@ -1014,6 +1029,13 @@ class MLXManager:
         self._registry_lock = threading.Lock()
         self._loading_locks: dict[str, threading.Lock] = {}
         self._last_load_errors: dict[str, str] = {}
+        # Per-alias inflight refcount. Incremented by
+        # ``acquire_inference_handle`` on entry, decremented on exit.
+        # Protected by ``_registry_lock``.
+        self._inflight: dict[str, int] = {}
+        # Aliases whose ``unload_model`` was called while pinned. The
+        # actual dict eviction happens when the last holder releases.
+        self._unload_pending: set[str] = set()
         self.context_windows: dict = {}
         self._scan()
         self._load_context_windows()
@@ -1072,21 +1094,130 @@ class MLXManager:
             }
 
     # ---------- loading (thread-safe) ------------------------------------
-    def _ensure_capacity_locked(self):
-        """Caller MUST hold _registry_lock."""
-        while len(self.loaded_models) >= MAX_CONCURRENT_MODELS:
-            oldest_alias, _ = self.loaded_models.popitem(last=False)
-            log.info("LRU eviction: '%s'", oldest_alias)
+    def _evict_alias_locked(self, alias: str) -> None:
+        """Caller MUST hold _registry_lock. Drop ``alias`` from the
+        loaded dict and prune its per-alias load lock. Does NOT check
+        inflight pinning — callers must do that.
+        """
+        self.loaded_models.pop(alias, None)
+        self._loading_locks.pop(alias, None)
+        self._unload_pending.discard(alias)
 
-    def unload_model(self, alias) -> bool:
-        """Explicitly unload a model from memory. Returns True if it was loaded."""
+    def _ensure_capacity_locked(self):
+        """Caller MUST hold _registry_lock.
+
+        Pick the oldest *unpinned* resident alias to evict until we're
+        under the cap. If every resident alias is currently in-flight,
+        let the new load proceed and exceed the cap rather than
+        deadlocking — log loudly so the operator sees they need to
+        raise ``MAX_CONCURRENT_MODELS`` or reduce request concurrency.
+        """
+        while len(self.loaded_models) >= MAX_CONCURRENT_MODELS:
+            victim = None
+            for alias in self.loaded_models:  # OrderedDict iteration is oldest-first
+                if self._inflight.get(alias, 0) == 0:
+                    victim = alias
+                    break
+            if victim is None:
+                pinned = {
+                    a: self._inflight.get(a, 0)
+                    for a in self.loaded_models
+                }
+                log.warning(
+                    "MAX_CONCURRENT_MODELS=%d exceeded: all %d resident "
+                    "aliases are in-flight (%s). New load proceeding; "
+                    "raise MAX_CONCURRENT_MODELS or reduce request "
+                    "concurrency to stay within the cap.",
+                    MAX_CONCURRENT_MODELS,
+                    len(self.loaded_models),
+                    pinned,
+                )
+                return
+            self._evict_alias_locked(victim)
+            log.info("LRU eviction: '%s'", victim)
+
+    def unload_model(self, alias) -> dict:
+        """Explicitly unload a model from memory.
+
+        Returns ``{"unloaded": bool, "deferred": bool}``. If the alias
+        is currently in-flight, the unload is deferred and fires when
+        the last holder releases via ``acquire_inference_handle``'s
+        context exit. Operators see ``deferred=True`` immediately so
+        the HTTP DELETE caller knows the action was accepted.
+        """
         with self._registry_lock:
             self._last_load_errors.pop(alias, None)
-            if alias in self.loaded_models:
-                del self.loaded_models[alias]
-                log.info("Unloaded model '%s' (resident: %s)", alias, list(self.loaded_models.keys()))
-                return True
-        return False
+            if alias not in self.loaded_models:
+                return {"unloaded": False, "deferred": False}
+            if self._inflight.get(alias, 0) > 0:
+                self._unload_pending.add(alias)
+                log.info(
+                    "Unload deferred for '%s' (inflight=%d); will fire on "
+                    "last release",
+                    alias,
+                    self._inflight[alias],
+                )
+                return {"unloaded": False, "deferred": True}
+            self._evict_alias_locked(alias)
+            log.info(
+                "Unloaded model '%s' (resident: %s)",
+                alias,
+                list(self.loaded_models.keys()),
+            )
+            return {"unloaded": True, "deferred": False}
+
+    def pin_alias(self, alias: str) -> None:
+        """Increment the inflight refcount for ``alias``. Caller MUST
+        pair this with exactly one ``release_pin(alias)`` in a
+        ``finally`` block. Use ``acquire_inference_handle`` when the
+        load + pin + generation all happen in the same synchronous
+        scope; use this lower-level method when the pin must outlive
+        the function call (e.g. a Flask streaming generator)."""
+        with self._registry_lock:
+            self._inflight[alias] = self._inflight.get(alias, 0) + 1
+
+    def release_pin(self, alias: str) -> None:
+        """Decrement the inflight refcount for ``alias``. If the
+        refcount hits zero and an unload was deferred while pinned,
+        the actual eviction fires here."""
+        with self._registry_lock:
+            remaining = self._inflight.get(alias, 1) - 1
+            if remaining <= 0:
+                self._inflight.pop(alias, None)
+                if alias in self._unload_pending:
+                    self._evict_alias_locked(alias)
+                    log.info(
+                        "Deferred unload of '%s' fired (resident: %s)",
+                        alias,
+                        list(self.loaded_models.keys()),
+                    )
+            else:
+                self._inflight[alias] = remaining
+
+    @contextlib.contextmanager
+    def acquire_inference_handle(self, alias):
+        """Reserve an alias for inference. Yields
+        ``(model, tokenizer, gen_lock)`` or ``None`` if the load
+        failed (caller checks the yielded value).
+
+        While the context is active the alias is *pinned*:
+        ``_ensure_capacity_locked`` will not evict it, and
+        ``unload_model`` defers the actual drop until the last holder
+        releases. This is the canonical entry point for every
+        synchronous inference call site; for Flask streaming paths
+        (where the generator outlives the function call), use
+        ``pin_alias`` / ``release_pin`` directly and tie the release
+        to the generator's ``finally`` block.
+        """
+        handle = self.load_model(alias)
+        if handle is None:
+            yield None
+            return
+        self.pin_alias(alias)
+        try:
+            yield handle
+        finally:
+            self.release_pin(alias)
 
     def load_model(self, alias):
         """Returns (model, tokenizer, gen_lock) or None.
@@ -2160,68 +2291,68 @@ def _mlx_chat_completion(alias, messages, max_tokens=None, temperature=None, top
         payload, _headers = _admission_retry_hint(alias, ad_meta)
         return None, payload.get("error") or "Admission rejected"
     try:
-        handle = mlx_manager.load_model(alias)
-        if handle is None:
-            load_err = mlx_manager.get_last_load_error(alias)
-            if load_err:
-                return None, load_err
-            return None, f"Could not load MLX model '{alias}'"
-        model, tokenizer, gen_lock = handle
+        with mlx_manager.acquire_inference_handle(alias) as handle:
+            if handle is None:
+                load_err = mlx_manager.get_last_load_error(alias)
+                if load_err:
+                    return None, load_err
+                return None, f"Could not load MLX model '{alias}'"
+            model, tokenizer, gen_lock = handle
 
-        profile = get_model_profile(alias)
-        temperature, top_p = _apply_sampler_defaults(temperature, top_p, profile)
-        msgs, formatted, prompt_tok, trim_err = _trim_messages_for_context(
-            tokenizer,
-            messages if isinstance(messages, list) else [],
-            prompt or "",
-            int(profile.get("context_window") or 8192),
-            _clamp_max_tokens(max_tokens, profile),
-            MLX_CONTEXT_TRIM_BUFFER,
-        )
-        if trim_err:
-            return None, trim_err
-        if not formatted:
-            return None, "empty prompt"
-
-        mt = _clamp_max_tokens(max_tokens, profile)
-        cw = int(profile.get("context_window") or 8192)
-        mt, _clamped, impossible = _budget_max_tokens(prompt_tok, mt, cw, MLX_CONTEXT_TRIM_BUFFER)
-        if impossible:
-            return None, (
-                f"No completion budget left (prompt_tokens≈{prompt_tok}, context_window={cw}). "
-                "Shorten the prompt or choose a larger-context model."
+            profile = get_model_profile(alias)
+            temperature, top_p = _apply_sampler_defaults(temperature, top_p, profile)
+            msgs, formatted, prompt_tok, trim_err = _trim_messages_for_context(
+                tokenizer,
+                messages if isinstance(messages, list) else [],
+                prompt or "",
+                int(profile.get("context_window") or 8192),
+                _clamp_max_tokens(max_tokens, profile),
+                MLX_CONTEXT_TRIM_BUFFER,
             )
+            if trim_err:
+                return None, trim_err
+            if not formatted:
+                return None, "empty prompt"
 
-        t0 = time.time()
-        with gen_lock:
-            try:
-                text, prompt_tok, comp_tok = _mlx_generate_text_timed(
-                    model, tokenizer, formatted, mt, temperature, top_p,
-                    timeout_sec=GENERATION_TIMEOUT,
+            mt = _clamp_max_tokens(max_tokens, profile)
+            cw = int(profile.get("context_window") or 8192)
+            mt, _clamped, impossible = _budget_max_tokens(prompt_tok, mt, cw, MLX_CONTEXT_TRIM_BUFFER)
+            if impossible:
+                return None, (
+                    f"No completion budget left (prompt_tokens≈{prompt_tok}, context_window={cw}). "
+                    "Shorten the prompt or choose a larger-context model."
                 )
-            except TimeoutError as e:
-                return None, str(e)
-            except Exception as e:
-                return None, _mlx_error_with_guidance(e, "MLX generation error")
-        elapsed = int((time.time() - t0) * 1000)
 
-        return {
-            "id": f"chatcmpl_{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": alias,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text or ""},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tok,
-                "completion_tokens": comp_tok,
-                "total_tokens": prompt_tok + comp_tok,
-            },
-            "_meta": {"latency_ms": elapsed, "backend": "mlx"},
-        }, None
+            t0 = time.time()
+            with gen_lock:
+                try:
+                    text, prompt_tok, comp_tok = _mlx_generate_text_timed(
+                        model, tokenizer, formatted, mt, temperature, top_p,
+                        timeout_sec=GENERATION_TIMEOUT,
+                    )
+                except TimeoutError as e:
+                    return None, str(e)
+                except Exception as e:
+                    return None, _mlx_error_with_guidance(e, "MLX generation error")
+            elapsed = int((time.time() - t0) * 1000)
+
+            return {
+                "id": f"chatcmpl_{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": alias,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text or ""},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tok,
+                    "completion_tokens": comp_tok,
+                    "total_tokens": prompt_tok + comp_tok,
+                },
+                "_meta": {"latency_ms": elapsed, "backend": "mlx"},
+            }, None
     finally:
         _admission_release(alias)
 
@@ -3005,20 +3136,46 @@ def list_models():
 
 @app.route("/v1/models/<path:alias>", methods=["DELETE"])
 def unload_model(alias):
-    """Explicitly unload a model from memory to free RAM."""
+    """Explicitly unload a model from memory to free RAM.
+
+    Returns:
+      200 + ``unloaded=True``  → model was resident and dropped immediately.
+      202 + ``deferred=True``  → model was in-flight; unload will fire when
+                                 the last holder releases. (HTTP 202 Accepted
+                                 is the correct shape for "request received,
+                                 action queued".)
+      404 + ``unloaded=False`` → model was not loaded to begin with.
+    """
     if _GRAB is not None:
         return Response(
             json.dumps({"error": "Cannot unload in grab mode (single-model)."}),
             status=400, mimetype="application/json",
         )
-    if mlx_manager.unload_model(alias):
+    result = mlx_manager.unload_model(alias)
+    if result["unloaded"]:
         return Response(
             json.dumps({
                 "ok": True,
                 "unloaded": alias,
+                "deferred": False,
                 "resident": mlx_manager.get_loaded_aliases(),
             }),
             status=200, mimetype="application/json",
+        )
+    if result["deferred"]:
+        return Response(
+            json.dumps({
+                "ok": True,
+                "unloaded": None,
+                "deferred": True,
+                "alias": alias,
+                "note": (
+                    f"Model '{alias}' is in-flight; unload deferred until "
+                    "the last active request releases."
+                ),
+                "resident": mlx_manager.get_loaded_aliases(),
+            }),
+            status=202, mimetype="application/json",
         )
     return Response(
         json.dumps({
@@ -3244,6 +3401,24 @@ def _handle_chat_request(data, request_headers=None):
             return _admission_err_response(load_err, 503)
         return _admission_err_response(f"Could not load MLX model '{alias}'", 503)
 
+    # Pin the alias for the duration of this request (and the streaming
+    # generator's lifetime if streaming). Released in the streaming
+    # generator's finally OR the non-streaming finally below — never
+    # both. We pin AFTER load_model so the load itself can still
+    # trigger LRU eviction of a different alias if needed.
+    mlx_manager.pin_alias(alias)
+    pin_released = False
+
+    def _release_pin_once():
+        nonlocal pin_released
+        if not pin_released:
+            pin_released = True
+            mlx_manager.release_pin(alias)
+
+    def _pin_err_response(msg: str, code: int = 400):
+        _release_pin_once()
+        return _admission_err_response(msg, code)
+
     model, tokenizer, gen_lock = handle
     profile = get_model_profile(alias)
     messages = data.get("messages", [])
@@ -3263,9 +3438,9 @@ def _handle_chat_request(data, request_headers=None):
         MLX_CONTEXT_TRIM_BUFFER,
     )
     if trim_err:
-        return _admission_err_response(trim_err, 400)
+        return _pin_err_response(trim_err, 400)
     if not formatted:
-        return _admission_err_response("empty prompt", 400)
+        return _pin_err_response("empty prompt", 400)
 
     max_tokens = _clamp_max_tokens(data.get("max_tokens"), profile)
     cw = int(profile.get("context_window") or 8192)
@@ -3273,7 +3448,7 @@ def _handle_chat_request(data, request_headers=None):
         prompt_tok, max_tokens, cw, MLX_CONTEXT_TRIM_BUFFER,
     )
     if impossible:
-        return _admission_err_response(
+        return _pin_err_response(
             f"No completion budget left (prompt_tokens≈{prompt_tok}, context_window={cw}). "
             "Shorten the prompt or choose a larger-context model.",
             400,
@@ -3392,6 +3567,7 @@ def _handle_chat_request(data, request_headers=None):
                         _mlx_dash.metrics_store.active_exit(alias)
             finally:
                 _admission_release(alias)
+                _release_pin_once()
 
         headers = {"X-Model-Routed-To": f"mlx/{alias}"}
         if fallback_from:
@@ -3460,6 +3636,7 @@ def _handle_chat_request(data, request_headers=None):
         if _mlx_dash is not None:
             _mlx_dash.metrics_store.active_exit(alias)
         _admission_release(alias)
+        _release_pin_once()
 
     elapsed = int((time.perf_counter() - t0) * 1000)
 
@@ -4111,21 +4288,24 @@ def _preload_and_validate(aliases_to_preload: list[str]):
         if err or not resolved:
             log.warning("Preload '%s' skipped: %s", alias, err)
             continue
-        handle = mlx_manager.load_model(resolved)
-        if handle is None:
-            load_err = mlx_manager.get_last_load_error(resolved)
-            if load_err:
-                log.warning("Preload '%s' failed to load: %s", resolved, load_err)
-            else:
-                log.warning("Preload '%s' failed to load", resolved)
-            continue
-        model, tokenizer, gen_lock = handle
-        try:
-            with gen_lock:
-                _mlx_generate_text(model, tokenizer, "Hello", 4)
-            log.info("Preload '%s' verified OK", resolved)
-        except Exception as e:
-            log.warning("Preload '%s' loaded but self-test failed: %s", resolved, e)
+        # acquire_inference_handle pins the alias during the self-test
+        # so a concurrent dashboard load or LRU pressure can't evict
+        # the freshly-loaded model out from under the generate() call.
+        with mlx_manager.acquire_inference_handle(resolved) as handle:
+            if handle is None:
+                load_err = mlx_manager.get_last_load_error(resolved)
+                if load_err:
+                    log.warning("Preload '%s' failed to load: %s", resolved, load_err)
+                else:
+                    log.warning("Preload '%s' failed to load", resolved)
+                continue
+            model, tokenizer, gen_lock = handle
+            try:
+                with gen_lock:
+                    _mlx_generate_text(model, tokenizer, "Hello", 4)
+                log.info("Preload '%s' verified OK", resolved)
+            except Exception as e:
+                log.warning("Preload '%s' loaded but self-test failed: %s", resolved, e)
 
 
 def _download_model(repo_id: str) -> int:
