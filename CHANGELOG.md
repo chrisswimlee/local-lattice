@@ -12,6 +12,26 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Added (MLX gateway: focused test suites for discovery and admission)
+
+Closes the audit's "zero MLX-specific test coverage for core load/
+evict/admit paths" finding. The LM Studio gateway already has
+comprehensive `test_resolver.py` / `test_swarm_intents.py` /
+`test_concurrency.py` coverage; this brings the MLX side roughly
+in parity.
+
+- `tests/test_mlx_discovery.py` — 9 tests covering flat layout,
+  publisher layout, mixed layouts, missing root, skip-non-config
+  dirs, ignore files at root, env override semantics, missing
+  context-windows file, and fresh-manager empty load-error state.
+  All use real tmp directory trees so the actual ``_scan`` walk
+  executes end-to-end.
+- `tests/test_mlx_admission.py` — 7 tests covering admission-disabled
+  no-op (cap=0 legacy mode), cap=1 serialization (worker thread
+  proves blocking), per-model queue overflow 429, global queue
+  overflow 429, wait-timeout 429, release decrements inflight,
+  snapshot reports state for /healthz consumers.
+
 ### Fixed (cross-gateway: shared OOM classifier with word-boundary regex)
 
 Closes the audit finding that MLX-native OOM exception strings were
