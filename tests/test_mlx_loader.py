@@ -297,3 +297,120 @@ def test_unload_of_unloaded_alias_returns_clean_status() -> None:
     """
     result = _run_mlx_subprocess(snippet)
     assert result["result"] == {"unloaded": False, "deferred": False}
+
+
+# ---------------------------------------------------------------------------
+# PR 3 — Metal cache teardown after eviction
+# ---------------------------------------------------------------------------
+
+
+def test_eviction_invokes_metal_cache_teardown_helper() -> None:
+    """After LRU eviction during a load, ``_post_evict_cleanup`` must
+    be called outside the registry lock for each evicted alias.
+    """
+    snippet = _setup_fake_loader() + """
+    mod.MAX_CONCURRENT_MODELS = 1
+    mgr = mod.mlx_manager
+    mgr.registry.update({
+        "fake-a": "/fake/path/a",
+        "fake-b": "/fake/path/b",
+    })
+
+    # Spy on _post_evict_cleanup at the module level so we record both
+    # LRU-eviction-during-load and explicit unload paths.
+    invocations = []
+    _orig = mod._post_evict_cleanup
+    def spy(reason, alias):
+        invocations.append((reason, alias))
+        _orig(reason, alias)
+    mod._post_evict_cleanup = spy
+
+    # Load A (no eviction), then B (evicts A).
+    mgr.load_model("fake-a")
+    mgr.load_model("fake-b")
+    # Explicitly unload B.
+    mgr.unload_model("fake-b")
+
+    import json as _j
+    print("RESULT=" + _j.dumps({"invocations": invocations}))
+    """
+    result = _run_mlx_subprocess(snippet)
+    # Expect at least an LRU eviction of A and an unload of B.
+    reasons = {(reason, alias) for reason, alias in result["invocations"]}
+    assert ("lru-eviction", "fake-a") in reasons, (
+        f"LRU eviction did not trigger cleanup: {result['invocations']}"
+    )
+    assert ("unload", "fake-b") in reasons, (
+        f"explicit unload did not trigger cleanup: {result['invocations']}"
+    )
+
+
+def test_post_evict_cleanup_failure_does_not_break_eviction() -> None:
+    """Audit-derived safety net: if the Metal teardown helper raises,
+    the eviction itself must still complete and the manager must
+    remain usable. We patch _try_clear_mlx_metal_cache to raise.
+    """
+    snippet = _setup_fake_loader() + """
+    mod.MAX_CONCURRENT_MODELS = 1
+    mgr = mod.mlx_manager
+    mgr.registry.update({
+        "fake-a": "/fake/path/a",
+        "fake-b": "/fake/path/b",
+    })
+
+    # Make the teardown helper raise. _post_evict_cleanup wraps it in
+    # try/except so the exception should be swallowed.
+    def boom():
+        raise RuntimeError("simulated teardown failure")
+    mod._try_clear_mlx_metal_cache = boom
+
+    mgr.load_model("fake-a")
+    mgr.load_model("fake-b")  # evicts A; teardown raises but is swallowed
+    mgr.unload_model("fake-b")  # also triggers teardown
+    resident = mgr.get_loaded_aliases()
+
+    import json as _j
+    print("RESULT=" + _j.dumps({"resident": resident}))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["resident"] == [], (
+        f"manager not usable after teardown error: {result['resident']}"
+    )
+
+
+def test_deferred_unload_drains_cleanup_on_release() -> None:
+    """When an unload is deferred while the alias is pinned, the
+    eventual eviction (in release_pin) must also trigger
+    _post_evict_cleanup. Otherwise the slow path leaks Metal cache.
+    """
+    snippet = _setup_fake_loader() + """
+    mgr = mod.mlx_manager
+    mgr.registry["fake-a"] = "/fake/path/a"
+    mgr.load_model("fake-a")
+    mgr.pin_alias("fake-a")
+
+    invocations = []
+    _orig = mod._post_evict_cleanup
+    def spy(reason, alias):
+        invocations.append((reason, alias))
+        _orig(reason, alias)
+    mod._post_evict_cleanup = spy
+
+    mgr.unload_model("fake-a")  # deferred
+    inv_after_unload = list(invocations)
+    mgr.release_pin("fake-a")   # fires the deferred eviction
+    inv_after_release = list(invocations)
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "after_unload": inv_after_unload,
+        "after_release": inv_after_release,
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["after_unload"] == [], (
+        "cleanup fired during deferred unload — should wait for release"
+    )
+    assert ("deferred-unload", "fake-a") in [
+        (r, a) for r, a in result["after_release"]
+    ], f"deferred-unload cleanup never fired: {result['after_release']}"
