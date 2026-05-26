@@ -1065,7 +1065,11 @@ if CORS_ORIGINS:
 class MLXManager:
     """Discovers, loads, and serializes access to MLX models on disk.
 
-    `loaded_models[alias]` -> (model, tokenizer, gen_lock, last_used).
+    `loaded_models[alias]` -> (model, tokenizer, gen_lock). LRU recency
+    is tracked entirely via ``OrderedDict.move_to_end`` on every cache
+    hit; the previous 4-tuple stored a ``last_used`` timestamp that
+    was written on every hit and never read anywhere — dead weight
+    pruned in the PR 10 cleanup pass of the audit hardening plan.
 
     Concurrency rules:
       * `_registry_lock` protects the OrderedDict (eviction, insert, lookup),
@@ -1456,12 +1460,13 @@ class MLXManager:
         if not MLX_AVAILABLE:
             return None
 
-        # Fast-path cache check.
+        # Fast-path cache check. Entries are 3-tuples — LRU recency is
+        # tracked via OrderedDict ordering (move_to_end), so we no
+        # longer need a per-entry timestamp.
         with self._registry_lock:
             if alias in self.loaded_models:
-                model, tokenizer, gen_lock, _ = self.loaded_models[alias]
+                model, tokenizer, gen_lock = self.loaded_models[alias]
                 self.loaded_models.move_to_end(alias)
-                self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
                 return model, tokenizer, gen_lock
             path = self.registry.get(alias)
             if not path:
@@ -1472,9 +1477,8 @@ class MLXManager:
         with per_alias:
             with self._registry_lock:
                 if alias in self.loaded_models:
-                    model, tokenizer, gen_lock, _ = self.loaded_models[alias]
+                    model, tokenizer, gen_lock = self.loaded_models[alias]
                     self.loaded_models.move_to_end(alias)
-                    self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
                     return model, tokenizer, gen_lock
 
             log.info("Loading MLX model '%s' from %s", alias, path)
@@ -1491,7 +1495,7 @@ class MLXManager:
             with self._registry_lock:
                 self._ensure_capacity_locked()
                 gen_lock = threading.Lock()
-                self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
+                self.loaded_models[alias] = (model, tokenizer, gen_lock)
                 self._last_load_errors.pop(alias, None)
                 self._last_load_error_ts.pop(alias, None)
             # Drain Metal cleanup for anything evicted during
@@ -2516,16 +2520,35 @@ def _call_anthropic_chat(messages, model_override=None, **kwargs):
 # =============================================================================
 
 
-def _mlx_chat_completion(alias, messages, max_tokens=None, temperature=None, top_p=None, prompt=None):
-    """Returns (openai_shaped_response, error). Acquires per-model gen_lock."""
+def _mlx_chat_completion(
+    alias,
+    messages,
+    max_tokens=None,
+    temperature=None,
+    top_p=None,
+    prompt=None,
+    *,
+    queue_controls: dict | None = None,
+    request_id: str | None = None,
+):
+    """Returns (openai_shaped_response, error). Acquires per-model gen_lock.
+
+    ``queue_controls`` lets swarm callers thread per-request admission
+    priority / wait budgets through to the scheduler — the audit found
+    this was always ``None`` (top-level requests' priority was silently
+    dropped at the swarm fanout boundary). Pass-through is opt-in; the
+    HTTP chat handler still passes its parsed controls directly.
+    ``request_id`` defaults to a fresh swarm-flavored UUID when not
+    provided.
+    """
     if not MLX_AVAILABLE:
         return None, "MLX not available (mlx_lm not installed)"
 
     ok_ad, ad_meta = _admission_acquire(
         alias,
-        request_id=f"swarm_{uuid.uuid4().hex}",
+        request_id=request_id or f"swarm_{uuid.uuid4().hex}",
         stream=False,
-        queue_controls=None,
+        queue_controls=queue_controls,
     )
     if not ok_ad:
         payload, _headers = _admission_retry_hint(alias, ad_meta)
@@ -2624,8 +2647,15 @@ def _normalize_agent_spec(spec):
     return {"model": str(spec)}
 
 
-def _run_one_agent(spec, default_messages, default_kwargs, available):
-    """Returns (label, openai_response, error, latency_ms)."""
+def _run_one_agent(spec, default_messages, default_kwargs, available, *, queue_controls=None):
+    """Returns (label, openai_response, error, latency_ms).
+
+    ``queue_controls`` propagates per-request admission priority / wait
+    budgets from the parent (chat or HTTP /swarm/* handler) into the
+    per-agent admission acquire. Audit finding: this used to always
+    be None at the swarm fanout boundary, so the operator-supplied
+    priority on a swarm request was silently dropped for every agent.
+    """
     spec = _normalize_agent_spec(spec)
     requested = spec.get("model")
     requested_str = (requested or "").strip()
@@ -2665,6 +2695,7 @@ def _run_one_agent(spec, default_messages, default_kwargs, available):
         max_tokens=kwargs.get("max_tokens"),
         temperature=kwargs.get("temperature"),
         top_p=kwargs.get("top_p"),
+        queue_controls=queue_controls,
     )
     return alias, resp, err, int((time.time() - t0) * 1000)
 
@@ -2831,7 +2862,7 @@ def _expand_swarm_models(spec):
     return out, None
 
 
-def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id=None, route_kind="swarm_fanout"):
+def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id=None, route_kind="swarm_fanout", *, queue_controls=None):
     if not specs:
         return None, "swarm requires at least one model"
 
@@ -2914,7 +2945,7 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {
-            ex.submit(_run_one_agent, spec, messages, common_kwargs, available): i
+            ex.submit(_run_one_agent, spec, messages, common_kwargs, available, queue_controls=queue_controls): i
             for i, spec in enumerate(specs)
         }
         pending = set(futures.keys())

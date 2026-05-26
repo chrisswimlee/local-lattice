@@ -12,6 +12,29 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Changed (MLX gateway: cleanup — dead field + queue_controls + unload UI)
+
+Final polish pass closing the audit's lower-priority cleanup items:
+
+- `MLXManager.loaded_models` entries are now `(model, tokenizer,
+  gen_lock)` 3-tuples. The previous `last_used` timestamp was written
+  on every cache hit and never read — LRU recency is tracked entirely
+  via `OrderedDict.move_to_end`. Pinned with a regression test so a
+  future refactor can't silently re-add the field.
+- `_mlx_chat_completion` gained `queue_controls` and `request_id`
+  kwargs; `_run_one_agent` and `_fanout` thread them through. Audit
+  finding: the swarm fanout used to always pass `queue_controls=None`,
+  silently dropping per-request priority / wait budgets that the
+  HTTP handler had parsed from the request body.
+- Dashboard UI: each loaded-model pill now has an unload (×) button
+  wired to `DELETE /v1/models/<alias>` with a confirm dialog. Also
+  surfaces `load_error_count` from the snapshot for quick triage.
+  Operators no longer need a separate curl to free Metal RAM.
+
+Tests: 2 new tests in `tests/test_mlx_loader.py` covering the
+3-tuple shape regression pin and the queue_controls propagation
+contract.
+
 ### Added (MLX gateway: discovery hardening + runtime registry rescan)
 
 Closes the audit's discovery findings:

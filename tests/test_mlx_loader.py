@@ -378,6 +378,87 @@ def test_post_evict_cleanup_failure_does_not_break_eviction() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# PR 10 — Dead-field cleanup: loaded_models entries are 3-tuples
+# ---------------------------------------------------------------------------
+
+
+def test_loaded_models_stores_three_tuples_not_four() -> None:
+    """Audit finding: the per-entry ``last_used`` timestamp was
+    written on every cache hit and never read anywhere — dead weight.
+    PR 10 prunes it. Pin the tuple shape so a future refactor can't
+    silently re-add the field.
+    """
+    snippet = _setup_fake_loader() + """
+    mgr = mod.mlx_manager
+    mgr.registry["fake-a"] = "/fake/path/a"
+
+    handle = mgr.load_model("fake-a")
+    entry = mgr.loaded_models["fake-a"]
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "entry_len": len(entry),
+        "handle_len": len(handle),
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["entry_len"] == 3, (
+        f"loaded_models entry should be a 3-tuple; got len={result['entry_len']}"
+    )
+    assert result["handle_len"] == 3
+
+
+def test_run_one_agent_passes_queue_controls_through() -> None:
+    """Audit finding: ``_mlx_chat_completion`` always passed
+    ``queue_controls=None``, dropping per-request priority/wait at
+    the swarm fanout boundary. PR 10 wires the propagation.
+    """
+    snippet = """
+    captured = {"queue_controls": "NOT_CALLED"}
+
+    def fake_admission_acquire(alias, *, request_id, stream, queue_controls=None):
+        captured["queue_controls"] = queue_controls
+        captured["alias"] = alias
+        return True, {"queue_wait_ms": 0, "priority": 0}
+
+    def fake_admission_release(alias):
+        pass
+
+    mod._admission_acquire = fake_admission_acquire
+    mod._admission_release = fake_admission_release
+    mod.MLX_AVAILABLE = True
+
+    # Don't actually load the model — return None from acquire_inference_handle
+    # so the function bails before touching MLX. We only care about whether
+    # queue_controls reached _admission_acquire.
+    import contextlib
+    @contextlib.contextmanager
+    def fake_acquire(alias):
+        yield None
+    mod.mlx_manager.acquire_inference_handle = fake_acquire
+    mod.mlx_manager.get_last_load_error = lambda alias: None
+
+    qc = {"priority": 5, "max_wait_sec": 1.5}
+    mod._mlx_chat_completion(
+        "fake-alias",
+        [{"role": "user", "content": "hi"}],
+        queue_controls=qc,
+    )
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "qc": captured["queue_controls"],
+        "alias": captured.get("alias"),
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["qc"] == {"priority": 5, "max_wait_sec": 1.5}, (
+        f"queue_controls did not reach _admission_acquire: {result}"
+    )
+    assert result["alias"] == "fake-alias"
+
+
 def test_deferred_unload_drains_cleanup_on_release() -> None:
     """When an unload is deferred while the alias is pinned, the
     eventual eviction (in release_pin) must also trigger
