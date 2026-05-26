@@ -1015,18 +1015,13 @@ _MLX_OOM_HINT = (
 )
 
 
-def _is_probable_oom_error(exc: BaseException | str) -> bool:
-    txt = str(exc).lower()
-    markers = (
-        "out of memory",
-        "oom",
-        "mps backend out of memory",
-        "resource exhausted",
-        "killed",
-        "std::bad_alloc",
-        "allocation failed",
-    )
-    return any(m in txt for m in markers)
+# Re-export the shared OOM classifier from middle_layer.swarm. The
+# previous in-file implementation used a naive substring match that
+# false-positived on "zoom", "room", etc., and was not visible to the
+# swarm classifier — so MLX OOMs classified as error_kind="unknown"
+# in structured swarm error_details. PR 7 of the MLX audit hardening
+# pass consolidates both gateways onto the shared word-boundary regex.
+from middle_layer.swarm import is_probable_oom_error as _is_probable_oom_error  # noqa: E402
 
 
 def _mlx_error_with_guidance(exc: BaseException | str, prefix: str) -> str:

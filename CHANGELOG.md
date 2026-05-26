@@ -12,6 +12,34 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Fixed (cross-gateway: shared OOM classifier with word-boundary regex)
+
+Closes the audit finding that MLX-native OOM exception strings were
+classifying as `error_kind="unknown"` in structured swarm
+`error_details` — the LM Studio gateway's `_OOM_PHRASES` list was
+LM-Studio-targeted ("insufficient system resources", "would likely
+overload your system") and didn't recognize MLX wording ("out of
+memory", "MPS backend out of memory", "std::bad_alloc"). Also the
+naive `any(marker in text)` substring check false-positived on
+"zoom", "room", and any other word containing "oom".
+
+- New canonical `middle_layer.swarm.is_probable_oom_error(exc)` uses
+  a word-boundary regex (`(?ix) \b(?:out of memory|oom|mps backend
+  out of memory|resource[\s_-]exhausted|killed|std::bad_alloc|
+  allocation failed)\b`) plus the legacy LM-Studio phrase fragments.
+- `middle_layerMLX.py` re-exports the shared helper as
+  `_is_probable_oom_error` (back-compat alias) and drops its own
+  in-file substring implementation.
+- `classify_swarm_error()` uses the shared helper so MLX OOMs now
+  classify as `error_kind="oom"` in swarm structured responses.
+
+Tests: 35 new tests in `tests/test_oom_classification.py` covering
+a parametrized true/false-positive matrix (CUDA, Metal, OS-level,
+bare OOM, allocation-failed, LM Studio specific wording on the
+true side; "zoom"/"room"/"broomstick"/timeout/auth/empty/None/non-
+string on the false side) plus integration tests confirming MLX
+OOM strings now bucket as `"oom"` in `classify_swarm_error`.
+
 ### Added (MLX gateway: end-to-end error observability)
 
 Closes the audit's "load errors only visible in logs" and "non-stream
