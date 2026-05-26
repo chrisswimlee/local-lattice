@@ -201,6 +201,15 @@ class MetricsStore:
         available = mgr.get_available_aliases() if mgr else []
         loaded = mgr.get_loaded_aliases() if mgr else []
         mem = mgr.get_memory_stats() if mgr and hasattr(mgr, "get_memory_stats") else {}
+        # Surface MLXManager's sticky load-error map (added in the audit
+        # hardening pass). Operators see "alias X failed to load" in the
+        # dashboard snapshot without log grep.
+        load_errors: dict[str, Any] = {}
+        if mgr and hasattr(mgr, "get_recent_load_errors"):
+            try:
+                load_errors = mgr.get_recent_load_errors()
+            except Exception:
+                load_errors = {}
         budget_fn = _CTX.get("swarm_budget_fn")
         budget_example = float(budget_fn(3)) if callable(budget_fn) else None
         grab = bool(_CTX.get("grab_mode")()) if callable(_CTX.get("grab_mode")) else False
@@ -219,6 +228,8 @@ class MetricsStore:
             "models_available": available,
             "models_loaded": loaded,
             "memory": mem,
+            "recent_load_errors": load_errors,
+            "load_error_count": len(load_errors),
             "active_by_alias": active,
             "events": events[-MLX_DASHBOARD_MAX_EVENTS :],
             "preferences": self.get_preferences(),

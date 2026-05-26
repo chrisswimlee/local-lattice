@@ -12,6 +12,31 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Added (MLX gateway: end-to-end error observability)
+
+Closes the audit's "load errors only visible in logs" and "non-stream
+generation failures unlogged" findings.
+
+- `MLXManager.get_recent_load_errors()` returns `{alias: {error, ts}}`
+  for every alias with a sticky load failure. Backed by a new
+  `_last_load_error_ts` dict updated in lockstep with
+  `_last_load_errors` so operators can see when each failure happened.
+- `/healthz` now includes `recent_load_errors` — the same snapshot.
+  Operators can answer "why isn't model X serving?" without grep.
+- Dashboard snapshot now includes `recent_load_errors` and a
+  `load_error_count` for quick triage.
+- `MLXManager.get_memory_stats()` also exposes
+  `recent_load_errors_count` for compact health views.
+- Non-stream generation 500s (both grab and multi-model paths) now
+  log at WARNING with alias + request_id + exception class +
+  elapsed_ms BEFORE the response is built. Previously these only
+  showed up in dashboard `record_event` — invisible to operators
+  who don't have the dashboard enabled.
+
+Tests: 3 new tests in `tests/test_mlx_health.py` covering
+`get_recent_load_errors` snapshot shape, `/healthz` exposing the
+field, and `get_memory_stats` including the count.
+
 ### Changed (MLX gateway: honest generation timeout semantics)
 
 Closes the audit's "timeout misleads operators and clients" finding.

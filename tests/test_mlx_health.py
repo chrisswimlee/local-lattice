@@ -57,6 +57,72 @@ def test_healthz_keeps_legacy_field_as_deprecated_alias() -> None:
     assert "advisory" in result["deprecated_note"].lower()
 
 
+def test_healthz_includes_recent_load_errors() -> None:
+    """After a load failure is recorded in MLXManager._last_load_errors,
+    /healthz must surface it under recent_load_errors so operators can
+    diagnose without grep-ing logs.
+    """
+    snippet = """
+    mod.MLX_AVAILABLE = True
+    # Manually seed a load error as if the load had failed.
+    mod.mlx_manager._last_load_errors["fake-alias"] = (
+        "Failed to load MLX model 'fake-alias': out of memory. Hint: lower MAX_CONCURRENT_MODELS."
+    )
+    mod.mlx_manager._last_load_error_ts["fake-alias"] = 1700000000
+
+    client = mod.app.test_client()
+    rv = client.get("/healthz")
+    body = rv.get_json() or {}
+    rle = body.get("recent_load_errors") or {}
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "rle": rle,
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert "fake-alias" in result["rle"], result
+    assert result["rle"]["fake-alias"]["ts"] == 1700000000
+    assert "out of memory" in result["rle"]["fake-alias"]["error"]
+
+
+def test_manager_recent_load_errors_helper_returns_snapshot() -> None:
+    """Sanity test for the new MLXManager.get_recent_load_errors()."""
+    snippet = """
+    mgr = mod.mlx_manager
+    mgr._last_load_errors["a"] = "err_a"
+    mgr._last_load_error_ts["a"] = 100
+    mgr._last_load_errors["b"] = "err_b"
+    mgr._last_load_error_ts["b"] = 200
+
+    result = mgr.get_recent_load_errors()
+    import json as _j
+    print("RESULT=" + _j.dumps({"result": result}))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["result"] == {
+        "a": {"error": "err_a", "ts": 100},
+        "b": {"error": "err_b", "ts": 200},
+    }
+
+
+def test_memory_stats_includes_load_error_count() -> None:
+    """get_memory_stats now exposes recent_load_errors_count for the
+    dashboard snapshot's quick triage view.
+    """
+    snippet = """
+    mgr = mod.mlx_manager
+    mgr._last_load_errors.clear()
+    mgr._last_load_errors["x"] = "err_x"
+    mgr._last_load_errors["y"] = "err_y"
+
+    stats = mgr.get_memory_stats()
+    import json as _j
+    print("RESULT=" + _j.dumps({"stats": stats}))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["stats"]["recent_load_errors_count"] == 2
+
+
 def test_generation_helper_does_not_raise_timeout_error() -> None:
     """Sanity test for the removal of dead TimeoutError handlers:
     ``_mlx_generate_text_timed`` must never raise TimeoutError, even
