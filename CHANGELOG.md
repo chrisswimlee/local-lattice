@@ -12,6 +12,34 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Performance (MLX gateway: explicit Metal cache teardown after eviction)
+
+Closes the audit finding that eviction was registry-only: dropping the
+`OrderedDict` reference and trusting refcount + GC to free Metal
+allocations. On macOS, that left peak RSS noticeably higher than
+steady-state for minutes after a model swap.
+
+- New `_try_clear_mlx_metal_cache()` helper feature-detects the
+  available teardown API (`mx.metal.clear_cache` → `mx.clear_cache`)
+  so this works across `mlx_lm` versions. All failures are swallowed
+  at the cleanup-helper boundary — Metal teardown is opportunistic
+  and never blocks eviction from completing.
+- `_post_evict_cleanup(reason, alias)` runs after both LRU eviction
+  (during a load) and explicit unload (including deferred-on-pin).
+  Always invoked *outside* `_registry_lock` so Metal teardown
+  doesn't block other manager operations.
+- New `MLX_FORCE_GC_ON_EVICT=1` (default off) adds a `gc.collect()`
+  after the Metal release for memory-tight Macs that want tighter
+  immediate RSS reclamation. Off by default because `gc.collect()`
+  is noticeable wall time and the Metal allocator usually reclaims
+  promptly once Python refs drop.
+
+Tests: 3 new tests in `tests/test_mlx_loader.py` covering: cleanup
+fires on both LRU-eviction and explicit-unload paths, teardown
+errors are swallowed so the eviction still completes, and deferred
+unloads fire cleanup on release rather than on the original
+`unload_model` call.
+
 ### Fixed (MLX gateway: pin in-flight models against eviction races)
 
 Closes the audit's highest-severity correctness finding. The LRU

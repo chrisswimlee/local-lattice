@@ -936,6 +936,78 @@ def _mlx_load_model(path: str):
         return mlx_lm.load(path)
 
 
+# Whether to force a ``gc.collect()`` after every Metal cache clear.
+# Off by default — gc.collect() is noticeable wall time on macOS, and
+# the Metal allocator usually reclaims promptly once Python refs drop.
+# Operators on memory-tight Macs can opt in to trade latency for tighter
+# RSS reclamation immediately after eviction.
+MLX_FORCE_GC_ON_EVICT = os.environ.get("MLX_FORCE_GC_ON_EVICT", "0").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+
+def _try_clear_mlx_metal_cache() -> str | None:
+    """Best-effort Metal cache release after MLX eviction or unload.
+
+    The mlx_lm public API has churned across versions; feature-detect
+    the available teardown call and silently skip on unsupported
+    variants. Returns the name of the function actually called (for
+    logging) or ``None`` if nothing was available.
+
+    Eviction never fails on teardown errors — at worst we leak some
+    Metal allocator slack until the next allocator pressure point.
+    """
+    try:
+        import mlx.core as _mx  # type: ignore
+    except ImportError:
+        return None
+    try:
+        if hasattr(_mx, "metal") and hasattr(_mx.metal, "clear_cache"):
+            _mx.metal.clear_cache()
+            return "mx.metal.clear_cache"
+        if hasattr(_mx, "clear_cache"):
+            _mx.clear_cache()
+            return "mx.clear_cache"
+    except Exception as e:  # noqa: BLE001
+        log.debug("Metal cache teardown failed (non-fatal): %s", e)
+    return None
+
+
+def _post_evict_cleanup(reason: str, alias: str) -> None:
+    """Run after a model is evicted from the MLXManager registry —
+    either by LRU eviction during a load or by an explicit (possibly
+    deferred) unload. Triggers the best-effort Metal cache release
+    and, if MLX_FORCE_GC_ON_EVICT is set, a Python-level gc.collect().
+
+    Every step here is wrapped in try/except: post-evict cleanup is
+    *opportunistic*. A failure to clear the Metal cache must never
+    prevent the eviction from completing — at worst we leak some
+    allocator slack until the next pressure point.
+    """
+    try:
+        cleared = _try_clear_mlx_metal_cache()
+        if cleared:
+            log.debug("Post-evict cleanup '%s' (%s): cleared via %s", alias, reason, cleared)
+    except Exception as e:  # noqa: BLE001
+        log.debug(
+            "Post-evict metal teardown for '%s' (%s) raised (non-fatal): %s",
+            alias, reason, e,
+        )
+    if MLX_FORCE_GC_ON_EVICT:
+        try:
+            import gc as _gc
+            collected = _gc.collect()
+            log.debug(
+                "Post-evict gc.collect '%s' (%s): freed %d objects",
+                alias, reason, collected,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "Post-evict gc.collect for '%s' (%s) raised (non-fatal): %s",
+                alias, reason, e,
+            )
+
+
 _MLX_OOM_HINT = (
     "Detected probable memory pressure. Try the stable launcher "
     "(./start_middle_layerMLX_5001_stable.sh) or lower MAX_CONCURRENT_MODELS, "
@@ -1036,6 +1108,12 @@ class MLXManager:
         # Aliases whose ``unload_model`` was called while pinned. The
         # actual dict eviction happens when the last holder releases.
         self._unload_pending: set[str] = set()
+        # Aliases that were evicted under a locked block and need a
+        # post-evict Metal cleanup pass once the lock is released.
+        # Drained by ``_drain_post_evict_cleanup`` which the caller
+        # invokes *after* releasing ``_registry_lock`` so Metal
+        # teardown doesn't block other manager operations.
+        self._pending_post_evict_cleanup: list[str] = []
         self.context_windows: dict = {}
         self._scan()
         self._load_context_windows()
@@ -1103,6 +1181,17 @@ class MLXManager:
         self._loading_locks.pop(alias, None)
         self._unload_pending.discard(alias)
 
+    def _drain_post_evict_cleanup(self, reason: str = "eviction") -> None:
+        """Run ``_post_evict_cleanup`` for every alias queued under
+        the registry lock. MUST be called outside the lock so Metal
+        teardown doesn't block other manager operations.
+        """
+        with self._registry_lock:
+            pending = list(self._pending_post_evict_cleanup)
+            self._pending_post_evict_cleanup.clear()
+        for alias in pending:
+            _post_evict_cleanup(reason, alias)
+
     def _ensure_capacity_locked(self):
         """Caller MUST hold _registry_lock.
 
@@ -1111,7 +1200,15 @@ class MLXManager:
         let the new load proceed and exceed the cap rather than
         deadlocking — log loudly so the operator sees they need to
         raise ``MAX_CONCURRENT_MODELS`` or reduce request concurrency.
+
+        Each successful eviction also triggers ``_post_evict_cleanup``
+        which best-effort-clears the Metal allocator cache (and
+        optionally runs ``gc.collect()`` when
+        ``MLX_FORCE_GC_ON_EVICT=1``). The cleanup runs *after*
+        releasing the registry lock so we don't block other callers
+        on Metal teardown.
         """
+        evicted_aliases: list[str] = []
         while len(self.loaded_models) >= MAX_CONCURRENT_MODELS:
             victim = None
             for alias in self.loaded_models:  # OrderedDict iteration is oldest-first
@@ -1134,7 +1231,14 @@ class MLXManager:
                 )
                 return
             self._evict_alias_locked(victim)
+            evicted_aliases.append(victim)
             log.info("LRU eviction: '%s'", victim)
+        # Defer the cleanup call to a sibling helper (called by load_model
+        # after dropping the registry lock) so we don't pay Metal teardown
+        # cost while holding the lock. We can't safely call it inline here
+        # because callers nest this inside a locked block.
+        if evicted_aliases:
+            self._pending_post_evict_cleanup.extend(evicted_aliases)
 
     def unload_model(self, alias) -> dict:
         """Explicitly unload a model from memory.
@@ -1159,12 +1263,16 @@ class MLXManager:
                 )
                 return {"unloaded": False, "deferred": True}
             self._evict_alias_locked(alias)
+            self._pending_post_evict_cleanup.append(alias)
             log.info(
                 "Unloaded model '%s' (resident: %s)",
                 alias,
                 list(self.loaded_models.keys()),
             )
-            return {"unloaded": True, "deferred": False}
+        # Drain Metal cleanup outside the registry lock so we don't
+        # block other manager operations on Metal teardown.
+        self._drain_post_evict_cleanup(reason="unload")
+        return {"unloaded": True, "deferred": False}
 
     def pin_alias(self, alias: str) -> None:
         """Increment the inflight refcount for ``alias``. Caller MUST
@@ -1180,12 +1288,15 @@ class MLXManager:
         """Decrement the inflight refcount for ``alias``. If the
         refcount hits zero and an unload was deferred while pinned,
         the actual eviction fires here."""
+        deferred_drained = False
         with self._registry_lock:
             remaining = self._inflight.get(alias, 1) - 1
             if remaining <= 0:
                 self._inflight.pop(alias, None)
                 if alias in self._unload_pending:
                     self._evict_alias_locked(alias)
+                    self._pending_post_evict_cleanup.append(alias)
+                    deferred_drained = True
                     log.info(
                         "Deferred unload of '%s' fired (resident: %s)",
                         alias,
@@ -1193,6 +1304,8 @@ class MLXManager:
                     )
             else:
                 self._inflight[alias] = remaining
+        if deferred_drained:
+            self._drain_post_evict_cleanup(reason="deferred-unload")
 
     @contextlib.contextmanager
     def acquire_inference_handle(self, alias):
@@ -1263,6 +1376,9 @@ class MLXManager:
                 gen_lock = threading.Lock()
                 self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
                 self._last_load_errors.pop(alias, None)
+            # Drain Metal cleanup for anything evicted during
+            # _ensure_capacity_locked, outside the lock.
+            self._drain_post_evict_cleanup(reason="lru-eviction")
             log.info("Loaded '%s' (resident: %s)", alias, self.get_loaded_aliases())
             return model, tokenizer, gen_lock
 
