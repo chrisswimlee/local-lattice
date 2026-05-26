@@ -64,19 +64,60 @@ SWARM_CHAT_ENABLED = os.environ.get("SWARM_CHAT_ENABLED", "1").strip().lower() n
 }
 
 #: Default ``swarm.models`` when the request body omits the field.
+#:
+#: Dynamic-by-default: ``"auto"`` expands to whatever LM Studio currently has
+#: loaded, so a default-shaped swarm fanout never JIT-loads a giant model
+#: behind the operator's back. The legacy default was
+#: ``"role:reasoner,role:coder,role:fast"`` — three role lookups that, on a
+#: machine with role prefs matching installed-but-not-loaded ids, would
+#: trigger LM Studio to spin up new models per request. AGENTS.md
+#: non-negotiable #1: keep the legacy value reachable via env var for one
+#: minor version and warn on unset so operators can flip back.
+_SWARM_CHAT_DEFAULT_MODELS_DEFAULT = "auto"
+_SWARM_CHAT_DEFAULT_MODELS_LEGACY = "role:reasoner,role:coder,role:fast"
+_SWARM_CHAT_DEFAULT_MODELS_ENV = os.environ.get("SWARM_CHAT_DEFAULT_MODELS")
+if _SWARM_CHAT_DEFAULT_MODELS_ENV is None:
+    warnings.warn(
+        "SWARM_CHAT_DEFAULT_MODELS is unset: defaulting to "
+        f"{_SWARM_CHAT_DEFAULT_MODELS_DEFAULT!r} (was "
+        f"{_SWARM_CHAT_DEFAULT_MODELS_LEGACY!r}) so default-shaped swarm "
+        "fanouts use the currently-loaded set instead of three role lookups "
+        "that may JIT-load installed-but-not-loaded models. Set "
+        f"SWARM_CHAT_DEFAULT_MODELS={_SWARM_CHAT_DEFAULT_MODELS_LEGACY!r} "
+        "to keep the legacy behavior; will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    _SWARM_CHAT_DEFAULT_MODELS_RAW = _SWARM_CHAT_DEFAULT_MODELS_DEFAULT
+else:
+    _SWARM_CHAT_DEFAULT_MODELS_RAW = _SWARM_CHAT_DEFAULT_MODELS_ENV
 SWARM_CHAT_DEFAULT_MODELS = [
     m.strip()
-    for m in os.environ.get(
-        "SWARM_CHAT_DEFAULT_MODELS", "role:reasoner,role:coder,role:fast"
-    ).split(",")
+    for m in _SWARM_CHAT_DEFAULT_MODELS_RAW.split(",")
     if m.strip()
 ]
 
 #: Default winner-pick strategy for ``swarmCouncil`` / ``swarmVote`` etc.
 #: ``swarm/fanout`` always defaults to ``"fanout"`` regardless of this value.
+#:
+#: ``best-of-n`` pairs with the curated ``"auto"`` model expansion
+#: (loaded + chat-capable, capped at ``SWARM_CHAT_AUTO_MAX``) to give a
+#: genuine swarm: a small diverse set of models, judged for consensus.
+#: For latency-over-quality, callers can pass ``strategy: "first-success"``
+#: per-request (which now actually returns on first success and cancels
+#: in-flight peers, see :func:`fanout`).
 SWARM_CHAT_DEFAULT_STRATEGY = os.environ.get(
     "SWARM_CHAT_DEFAULT_STRATEGY", "best-of-n"
 ).strip().lower()
+
+#: Cap on how many loaded chat-capable ids the ``auto`` /``loaded`` / ``*``
+#: sentinels expand to. Without a cap, a box with 17 loaded ids would fan
+#: every default-shaped swarm out to all 17 — most of the latency wasted
+#: on slow models the judge will never pick. Three is the sweet spot for
+#: diversity-vs-cost: one reasoner + one coder + one fast is enough to get
+#: a meaningful best-of-n vote without quadrupling p50 latency. Set to 0
+#: to disable the cap (legacy behavior).
+SWARM_CHAT_AUTO_MAX = max(0, int(os.environ.get("SWARM_CHAT_AUTO_MAX", "3")))
 
 #: Default judge model for ``best-of-n`` strategy when the request body
 #: doesn't override ``swarm.judge``.
@@ -151,7 +192,13 @@ def is_auto_swarm_token(value) -> bool:
 _is_auto_swarm_token = is_auto_swarm_token  # back-compat alias
 
 
-def expand_swarm_models(spec, available=None, *, fetch_loaded=None):
+def expand_swarm_models(
+    spec,
+    available=None,
+    *,
+    fetch_loaded=None,
+    max_auto_entries: int | None = None,
+):
     """Expand sentinel tokens in a swarm models list to loaded model ids.
 
     Recognized tokens (case-insensitive): ``auto``, ``loaded``, ``*``,
@@ -164,7 +211,15 @@ def expand_swarm_models(spec, available=None, *, fetch_loaded=None):
     ``available`` may be passed eagerly when the caller already has the list
     in hand. If a sentinel is present and ``available`` is None, ``fetch_loaded``
     (a zero-arg callable returning ``(ids, error)``) is invoked. This keeps the
-    module pure — the real gateway-specific probe lives in the gateway.
+    module pure — the real gateway-specific probe lives in the gateway. The
+    caller is expected to pass a probe that already returns only chat-capable
+    ids when ``auto`` is meant to drive ``/v1/chat/completions`` fanouts.
+
+    ``max_auto_entries`` caps how many ids each sentinel token contributes,
+    so a default-shaped swarm against a box with N loaded chat models doesn't
+    explode into an N-way fanout. ``None`` / ``0`` disables the cap. The cap
+    is applied per-sentinel and only to ids contributed by the sentinel —
+    explicit ids the caller listed alongside the sentinel are always kept.
 
     Returns ``(expanded_list, error_or_None)``. If a sentinel is present
     but the gateway reports zero loaded models, the sentinel contributes
@@ -186,15 +241,21 @@ def expand_swarm_models(spec, available=None, *, fetch_loaded=None):
         if err:
             return None, err
 
+    cap = max_auto_entries if (max_auto_entries and max_auto_entries > 0) else None
+
     out: list = []
     seen: set = set()
     for entry in items:
         if is_auto_swarm_token(entry):
+            taken = 0
             for mid in (loaded or []):
                 if not isinstance(mid, str) or mid in seen:
                     continue
+                if cap is not None and taken >= cap:
+                    break
                 seen.add(mid)
                 out.append(mid)
+                taken += 1
             continue
         if isinstance(entry, str):
             key = entry.strip()
@@ -640,13 +701,30 @@ def run_one_agent(spec, default_messages, default_kwargs, available, deps, loade
     return model_id, resp, err, int((time.time() - t0) * 1000)
 
 
-def fanout(specs, messages, common_kwargs, deps, max_parallel=None):
+def fanout(
+    specs,
+    messages,
+    common_kwargs,
+    deps,
+    max_parallel=None,
+    *,
+    early_exit_on_first_success: bool = False,
+):
     """Run each spec in parallel (bounded). Returns ``(results_list, error)``.
 
     Result rows carry the structured-error fields (``agent_id``,
     ``error_kind``, ``http_status``, ``error_detail``) so the all-failed
     branch in :func:`run_swarm_chat_completion` can build the structured
     ``error_details`` body without a second pass.
+
+    When ``early_exit_on_first_success=True``, the fanout stops scheduling
+    new agents and attempts to cancel any not-yet-started futures the
+    moment one agent returns ``ok=True`` with non-empty text. Already-
+    running agents continue (Python ThreadPoolExecutor can't preempt them),
+    but their results are discarded and the returned list reflects only
+    the agents that had completed by then plus the winning one. This is
+    the real "fastest wins" semantic — picking ``successes[0]`` in
+    input order from a wait-for-all result is *not* the same thing.
     """
     if not specs:
         return None, "swarm requires at least one model"
@@ -675,7 +753,17 @@ def fanout(specs, messages, common_kwargs, deps, max_parallel=None):
     results: list = [None] * len(specs)
     workers = max(1, min(cap, len(specs)))
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    # We deliberately avoid the ``with ThreadPoolExecutor(...)`` context
+    # manager here because its ``__exit__`` calls ``shutdown(wait=True)``,
+    # which would block early-exit returns on any in-flight peer until
+    # ``SWARM_PER_CALL_TIMEOUT`` (180s default) fires — defeating the
+    # whole point of early-exit. Instead we manage shutdown explicitly so
+    # the early-exit branch can ``shutdown(wait=False, cancel_futures=True)``
+    # and return immediately. Orphaned threads finish in the background
+    # bounded by the per-call timeout.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    early_exited = False
+    try:
         futs = {
             pool.submit(run_one_agent, spec, messages, common_kwargs, available, deps, loaded): i
             for i, spec in enumerate(specs)
@@ -722,6 +810,16 @@ def fanout(specs, messages, common_kwargs, deps, max_parallel=None):
                 "response": resp,
                 "text": text,
             }
+            if early_exit_on_first_success and ok:
+                early_exited = True
+                break
+    finally:
+        # ``cancel_futures=True`` (3.9+) prevents not-yet-started peers
+        # from running. ``wait=False`` on the early-exit branch returns
+        # control to the caller without joining still-running peers;
+        # those threads finish in the background, bounded by the
+        # per-call timeout, and their results are simply discarded.
+        pool.shutdown(wait=not early_exited, cancel_futures=True)
     return results, None
 
 
@@ -771,8 +869,25 @@ def run_swarm_chat_completion(requested_model, json_data, deps, intent: str = "c
     if not isinstance(models, (list, str)) or not models:
         return None, "swarm.models must be a non-empty list (or 'auto')", None
 
+    # ``auto`` should expand against the truly-loaded, chat-capable set
+    # (not the installed set), so a default-shaped swarm never adds an
+    # embedding model or an installed-but-not-loaded id to the fanout. We
+    # fall back to ``get_available_models`` when the gateway didn't wire a
+    # loaded probe — in that case the strict resolver will still reject
+    # not-loaded ids per-agent.
+    def _fetch_auto_pool():
+        if deps.get_loaded_models is not None:
+            ids, err = deps.get_loaded_models()
+            if err:
+                return ids, err
+            if ids:
+                return ids, None
+        return deps.get_available_models()
+
     models, exp_err = expand_swarm_models(
-        models, fetch_loaded=deps.get_available_models
+        models,
+        fetch_loaded=_fetch_auto_pool,
+        max_auto_entries=SWARM_CHAT_AUTO_MAX,
     )
     if exp_err:
         return None, exp_err, None
@@ -782,9 +897,27 @@ def run_swarm_chat_completion(requested_model, json_data, deps, intent: str = "c
             "LM Studio. Load at least one model (or pass an explicit swarm.models)."
         ), None
 
-    candidates, err = fanout(models, messages, common, deps, max_parallel=max_parallel)
+    # Strategies that pick the temporally-first successful candidate don't
+    # need every agent's output, so let fanout cancel pending peers as soon
+    # as one succeeds. ``best-of-n`` and ``longest`` still wait for all so
+    # the judge / max-by-length actually has multiple candidates to compare.
+    early_exit = strategy in ("first-success", "first_success", "fanout")
+
+    candidates, err = fanout(
+        models,
+        messages,
+        common,
+        deps,
+        max_parallel=max_parallel,
+        early_exit_on_first_success=early_exit,
+    )
     if err:
         return None, err, None
+
+    # When ``fanout`` exits early, only completed agents are in the list
+    # (the rest are ``None`` placeholders). Drop those so downstream
+    # filtering doesn't trip on them.
+    candidates = [c for c in candidates if c is not None]
 
     successes = [c for c in candidates if c["ok"] and c.get("text")]
     if not successes:
@@ -971,6 +1104,7 @@ __all__ = [
     "SWARM_CHAT_DEFAULT_MODELS",
     "SWARM_CHAT_DEFAULT_STRATEGY",
     "SWARM_CHAT_DEFAULT_JUDGE",
+    "SWARM_CHAT_AUTO_MAX",
     "SWARM_STREAM_CHUNK_CHARS",
     "MAX_PARALLEL_MODEL_CALLS",
     "LM_STUDIO_PER_MODEL_INFLIGHT_CAP",

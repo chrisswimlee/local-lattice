@@ -149,10 +149,18 @@ def test_run_swarm_chat_completion_fanout_intent_defaults_strategy() -> None:
     saved_swarm_default = runner.SWARM_CHAT_DEFAULT_MODELS
     saved_mod_default = mod.SWARM_CHAT_DEFAULT_MODELS
 
-    def fake_fanout_with_deps(specs, messages, common, deps, max_parallel=None):
+    def fake_fanout_with_deps(
+        specs,
+        messages,
+        common,
+        deps,
+        max_parallel=None,
+        **kwargs,
+    ):
         # Adapter: swarm.run_swarm_chat_completion calls swarm.fanout with a
-        # ``deps`` positional, but the legacy fake_fanout signature doesn't
-        # take it. Drop and forward.
+        # ``deps`` positional and an ``early_exit_on_first_success`` kwarg
+        # (added in the swarm-intelligence-effectiveness pass). The legacy
+        # fake_fanout signature doesn't take either; drop and forward.
         return fake_fanout(specs, messages, common, max_parallel=max_parallel)
 
     try:
