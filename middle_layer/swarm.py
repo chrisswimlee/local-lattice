@@ -312,15 +312,72 @@ SWARM_ERROR_KINDS = frozenset({
 
 _SWARM_ERROR_KINDS = SWARM_ERROR_KINDS  # back-compat alias
 
+# LM-Studio-specific OOM phrasing. Kept as a separate tuple from
+# ``_OOM_PATTERN`` below so the classifier can match LM Studio's
+# wording (which embeds OOM in surrounding prose like "model loading
+# was stopped because it would likely overload your system") without
+# requiring the operator-friendly "out of memory" / "OOM" tokens.
 _OOM_PHRASES = (
     "insufficient system resources",
     "would likely overload your system",
     "model loading was stopped",
 )
+# Cross-backend OOM marker regex. Replaces the previous naive
+# ``any(marker in text)`` substring check which false-positived on
+# "zoom", "room", and any other word containing the literal "oom"
+# substring. Word-boundary matching here covers all of LM Studio,
+# MLX, CUDA, Metal, and generic allocator failures.
+#
+# Lives in the shared swarm module so both the LM Studio resolver
+# and the MLX gateway can classify OOMs consistently — the audit
+# found that MLX-side OOMs were classifying as "unknown" in swarm
+# structured error_details because the MLX wording (``"out of memory"``,
+# ``"mps backend out of memory"``, ``"std::bad_alloc"``) wasn't in
+# the LM-Studio-targeted phrase list.
+_OOM_PATTERN = re.compile(
+    r"(?ix)"
+    r"\b(?:"
+    r"out\s+of\s+memory"
+    r"|oom"
+    r"|mps\s+backend\s+out\s+of\s+memory"
+    # ``resource_exhausted`` is the CUDA gRPC enum spelling; allow both
+    # space and underscore (and dash) as joiners.
+    r"|resource[\s_-]exhausted"
+    r"|killed"
+    r"|std::bad_alloc"
+    r"|allocation\s+failed"
+    r")\b"
+)
 _CRASH_PHRASES = (
     "the model has crashed",
     "model has crashed without additional information",
 )
+
+
+def is_probable_oom_error(exc) -> bool:
+    """Best-effort guess at whether a backend-emitted error is an
+    out-of-memory failure. Used by both gateways for error-message
+    decoration AND by the swarm classifier so structured
+    ``error_kind="oom"`` works regardless of which backend produced
+    the failure.
+
+    Matches a word-boundary regex against the lowercased error text
+    plus the legacy LM-Studio-specific phrase fragments. Always
+    returns False for non-strings (None, numbers, etc.) — callers
+    pass either an Exception or a str interchangeably.
+    """
+    if exc is None:
+        return False
+    txt = str(exc)
+    if not txt:
+        return False
+    sl = txt.lower()
+    if _OOM_PATTERN.search(txt):
+        return True
+    return any(p in sl for p in _OOM_PHRASES)
+
+
+_is_probable_oom_error = is_probable_oom_error  # back-compat alias
 
 
 def extract_upstream_status(error_str) -> int | None:
@@ -382,9 +439,11 @@ def classify_swarm_error(error_str, http_status: int | None = None) -> str:
     if "anthropic_api_key not set" in sl or "litellm not available" in sl:
         return "config_error"
 
-    # OOM and model-crash are 4xx from LM Studio with specific phrases. Match
-    # the phrases first so we don't lose specificity to the generic "upstream_4xx".
-    if any(p in sl for p in _OOM_PHRASES):
+    # OOM and model-crash are 4xx from LM Studio with specific phrases
+    # AND MLX-native exception strings (out of memory, std::bad_alloc,
+    # MPS backend out of memory, etc.). Match the phrases first so we
+    # don't lose specificity to the generic "upstream_4xx" bucket.
+    if is_probable_oom_error(s):
         return "oom"
     if any(p in sl for p in _CRASH_PHRASES):
         return "model_crashed"
@@ -1118,6 +1177,7 @@ __all__ = [
     "expand_swarm_models",
     "extract_upstream_status",
     "classify_swarm_error",
+    "is_probable_oom_error",
     "strip_upstream_prefix",
     "normalize_agent_spec",
     "extract_text",
