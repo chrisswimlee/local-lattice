@@ -183,7 +183,7 @@ Quick reference of the most common knobs:
 | `DEFAULT_MODEL`             | _(empty)_   | Alias returned for `model: ""`/`auto`/`default`.        |
 | `MAX_CONCURRENT_MODELS`     | `2`         | LRU bound on resident MLX models.                       |
 | `MAX_PARALLEL_MODEL_CALLS`  | `2`         | Global concurrent-generation cap.                       |
-| `MLX_PER_MODEL_INFLIGHT_CAP`| `0` (∞)     | Per-alias generation cap.                               |
+| `MLX_PER_MODEL_INFLIGHT_CAP`| `1`         | Per-alias generation cap (MLX gateway). `0` disables admission (legacy; emits `DeprecationWarning` when unset before 0.2.0). |
 | `EXTRA_PLACEHOLDER_MODELS`  | _(unset → legacy OpenClaw set + `DeprecationWarning`)_ | Comma-separated extra "you pick" aliases; set to empty to exclude legacy ids. |
 | `PREFER_LOADED_MODELS`      | `strict`    | LM Studio gateway loaded-id policy. `strict` never JIT-loads installed-but-not-loaded ids; `1` falls back to the installed set on a miss; `0` ignores loaded vs installed. Unset emits a `DeprecationWarning` (legacy default was `1`). |
 | `SWARM_CHAT_DEFAULT_MODELS` | `auto`      | Default `swarm.models` list when a swarm chat request omits it. `auto`/`loaded`/`*` expand to the currently-loaded chat-capable set (filtered to exclude embedding models, capped at `SWARM_CHAT_AUTO_MAX`); or a comma-separated list of ids/`role:*` lookups. Unset emits a `DeprecationWarning` (legacy default was `role:reasoner,role:coder,role:fast`). |
