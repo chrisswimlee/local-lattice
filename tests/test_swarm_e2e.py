@@ -79,8 +79,11 @@ CALLS = []                       # every backend invocation (alias, messages, la
 JUDGE_REPLY = {"value": "B"}     # what the judge model returns (mutable)
 PER_CALL_SLEEP_S = {"value": 0.20}  # candidate inference latency
 
-def _fake_chat(alias, messages, max_tokens=None, temperature=None, top_p=None, prompt=None):
-    # Deterministic fake for ``_mlx_chat_completion``.
+def _fake_chat(alias, messages, max_tokens=None, temperature=None, top_p=None, prompt=None, **kwargs):
+    # Deterministic fake for ``_mlx_chat_completion``. ``**kwargs``
+    # absorbs forward-compat additions like ``queue_controls`` and
+    # ``request_id`` added in the audit hardening pass without
+    # requiring the test fake to mirror every signature change.
     is_judge = any(
         isinstance(m, dict)
         and "strict judge" in (m.get("content") or "").lower()
