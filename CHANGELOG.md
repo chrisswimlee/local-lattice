@@ -12,6 +12,36 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Changed (MLX gateway: honest generation timeout semantics)
+
+Closes the audit's "timeout misleads operators and clients" finding.
+`GENERATION_TIMEOUT` was documented as soft, but the codebase
+contained three dead `except TimeoutError` handlers around the timed
+generation helper that never fires, plus a `/healthz` field that
+advertised the timeout as if enforced.
+
+- Removed three dead 504 paths (grab chat, `_mlx_chat_completion`,
+  non-streaming chat handler). Each is now a single
+  `except Exception` that delegates to `_mlx_error_with_guidance`.
+- Renamed `/healthz` field `generation_timeout_sec` to
+  `generation_advisory_timeout_sec` to make the soft-budget
+  semantics explicit. The legacy field is kept as an alias for
+  one minor with a sibling `generation_timeout_sec_deprecated`
+  field carrying the migration message (AGENTS.md rule 1).
+- Documented in `_mlx_generate_text_timed`'s NOTE that `mlx_lm`
+  generation is not safely cancellable mid-flight, so per-request
+  `max_tokens` is the real budget control.
+
+Hard generation cancellation is deliberately out of scope:
+cancelling MLX mid-stream can leave KV cache in an inconsistent
+state, and the `mlx_lm` public API does not currently offer a safe
+interrupt path. Revisit if/when one lands.
+
+Tests: 3 new tests in `tests/test_mlx_health.py` covering the new
+field name, the deprecation-alias contract, and that
+`_mlx_generate_text_timed` never raises TimeoutError (pins the
+invariant against future regression).
+
 ### Fixed (MLX gateway: graceful HF downloads + grab/dashboard exclusion)
 
 Three operator-facing safety gaps from the audit:

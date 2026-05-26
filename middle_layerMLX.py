@@ -1684,29 +1684,12 @@ def _handle_grab_chat(data: dict, dash_rid: str | None = None, request_headers=N
                     model, tokenizer, formatted, max_tokens, temperature, top_p,
                     timeout_sec=GENERATION_TIMEOUT,
                 )
-            except TimeoutError as e:
-                elapsed = int((time.perf_counter() - t0) * 1000)
-                if _mlx_dash is not None:
-                    _mlx_dash.record_event(
-                        request_id=dash_rid,
-                        parent_request_id=None,
-                        agent_slot=None,
-                        route_kind="chat_grab",
-                        requested_model=req_str,
-                        resolved_model=str(label),
-                        backend="mlx",
-                        stream=False,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=max(1, elapsed),
-                        status="error",
-                        error_message=str(e),
-                        preview=_mlx_dash.build_preview(msgs),
-                    )
-                return Response(json.dumps({"error": str(e)}),
-                                status=504, mimetype="application/json")
             except Exception as e:
+                # NOTE: _mlx_generate_text_timed treats timeout_sec as a
+                # soft budget for logging only — mlx_lm generation is not
+                # safely cancellable mid-flight, so a TimeoutError handler
+                # here would be dead code. All real generation failures
+                # land in this Exception branch.
                 elapsed = int((time.perf_counter() - t0) * 1000)
                 if _mlx_dash is not None:
                     _mlx_dash.record_event(
@@ -2460,9 +2443,11 @@ def _mlx_chat_completion(alias, messages, max_tokens=None, temperature=None, top
                         model, tokenizer, formatted, mt, temperature, top_p,
                         timeout_sec=GENERATION_TIMEOUT,
                     )
-                except TimeoutError as e:
-                    return None, str(e)
                 except Exception as e:
+                    # _mlx_generate_text_timed treats timeout_sec as a
+                    # soft budget for logging; it never raises
+                    # TimeoutError (mlx_lm generation is not safely
+                    # cancellable mid-flight). All failures land here.
                     return None, _mlx_error_with_guidance(e, "MLX generation error")
             elapsed = int((time.time() - t0) * 1000)
 
@@ -3227,7 +3212,20 @@ def healthz():
             "mlx_queue_max_total": MLX_QUEUE_MAX_TOTAL or None,
             "mlx_queue_wait_timeout_sec": MLX_QUEUE_WAIT_TIMEOUT_SEC,
             "mlx_context_over_budget": MLX_CONTEXT_OVER_BUDGET,
-            "generation_timeout_sec": GENERATION_TIMEOUT,
+            # Renamed in 0.1.x from generation_timeout_sec to make the
+            # advisory nature explicit. mlx_lm generation is not safely
+            # cancellable mid-flight, so this value is a soft budget for
+            # logging only — it does not enforce a hard cancel. The
+            # legacy field name is kept for one minor as an alias with
+            # an X-Deprecated marker so clients can migrate.
+            "generation_advisory_timeout_sec": GENERATION_TIMEOUT,
+            "generation_timeout_sec": GENERATION_TIMEOUT,  # deprecated alias
+            "generation_timeout_sec_deprecated": (
+                "renamed to generation_advisory_timeout_sec; will be removed in 0.2.0. "
+                "Note: timeout is advisory (logging only); mlx_lm cannot be "
+                "safely cancelled mid-generation. Use per-request max_tokens "
+                "as the real budget control."
+            ),
             "admission": _admission_scheduler.snapshot(),
         }),
         status=200 if ok else 503,
@@ -3718,29 +3716,11 @@ def _handle_chat_request(data, request_headers=None):
                     model, tokenizer, formatted, max_tokens, temperature, top_p,
                     timeout_sec=GENERATION_TIMEOUT,
                 )
-            except TimeoutError as e:
-                elapsed = int((time.perf_counter() - t0) * 1000)
-                if _mlx_dash is not None:
-                    _mlx_dash.record_event(
-                        request_id=dash_rid,
-                        parent_request_id=None,
-                        agent_slot=None,
-                        route_kind="chat_mlx",
-                        requested_model=req_str,
-                        resolved_model=str(alias),
-                        backend="mlx",
-                        stream=False,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=max(1, elapsed),
-                        status="error",
-                        error_message=str(e),
-                        preview=_mlx_dash.build_preview(msgs),
-                    )
-                return Response(json.dumps({"error": str(e)}),
-                                status=504, mimetype="application/json")
             except Exception as e:
+                # _mlx_generate_text_timed treats timeout_sec as a soft
+                # budget for logging; it never raises TimeoutError
+                # (mlx_lm generation is not safely cancellable
+                # mid-flight). All real generation failures land here.
                 elapsed = int((time.perf_counter() - t0) * 1000)
                 if _mlx_dash is not None:
                     _mlx_dash.record_event(
