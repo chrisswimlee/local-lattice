@@ -178,6 +178,170 @@ def test_context_windows_load_silent_on_missing_file() -> None:
     assert isinstance(result["cw"], dict)
 
 
+def test_scan_logs_permission_error_on_publisher_subdir() -> None:
+    """Audit finding: the publisher subdir scan used a bare
+    ``except Exception: pass``, swallowing permission errors silently.
+    Now logs at WARNING with the path + exception.
+    """
+    snippet = """
+    import logging
+    import tempfile, os, sys, types
+
+    tmp = tempfile.mkdtemp(prefix="test-mlx-perm-")
+    # Real dir + monkey-patch os.scandir to raise PermissionError when
+    # called on the publisher subdir.
+    os.makedirs(os.path.join(tmp, "publisher-dir"), exist_ok=True)
+    open(os.path.join(tmp, "publisher-dir", "marker"), "w").close()
+
+    real_scandir = os.scandir
+    def fake_scandir(path):
+        if str(path).endswith("publisher-dir"):
+            raise PermissionError(f"simulated EACCES on {path}")
+        return real_scandir(path)
+    os.scandir = fake_scandir
+
+    captured = []
+    class Handler(logging.Handler):
+        def emit(self, record):
+            captured.append((record.levelname, record.getMessage()))
+    mod.log.addHandler(Handler())
+
+    mgr = mod.MLXManager(tmp)
+    os.scandir = real_scandir
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "warning_lines": [m for lvl, m in captured if lvl == "WARNING" and "publisher-dir" in m],
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert any("publisher-dir" in line for line in result["warning_lines"]), (
+        f"expected a WARNING mentioning the publisher dir; got {result['warning_lines']}"
+    )
+    assert any("EACCES" in line or "PermissionError" in line for line in result["warning_lines"]), (
+        f"expected exception detail in WARNING; got {result['warning_lines']}"
+    )
+
+
+def test_context_windows_warns_on_malformed_json() -> None:
+    """Audit finding: malformed mlx_context_windows.json used to be
+    silently swallowed — operators never knew their hints weren't
+    being applied. Now logs at WARNING.
+    """
+    snippet = """
+    import os, tempfile, logging
+
+    # mlx_context_windows.json is loaded from the script directory.
+    # Patch open() in mod's namespace so we control what it sees.
+    real_exists = os.path.exists
+    real_open = open
+    def fake_exists(p):
+        if str(p).endswith("mlx_context_windows.json"):
+            return True
+        return real_exists(p)
+    def fake_open(p, *args, **kwargs):
+        if str(p).endswith("mlx_context_windows.json"):
+            import io
+            return io.StringIO("{ not valid json }")
+        return real_open(p, *args, **kwargs)
+    mod.os.path.exists = fake_exists
+    # The MLXManager imports json + open via builtins; override those.
+    import builtins
+    builtins.open = fake_open
+
+    captured = []
+    class Handler(logging.Handler):
+        def emit(self, record):
+            captured.append((record.levelname, record.getMessage()))
+    mod.log.addHandler(Handler())
+
+    tmp = tempfile.mkdtemp(prefix="test-mlx-ctxw-")
+    mgr = mod.MLXManager(tmp)
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "warnings": [m for lvl, m in captured if lvl == "WARNING" and "context_windows" in m],
+        "cw_empty": mgr.context_windows == {},
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["cw_empty"] is True
+    assert any("context_windows" in w.lower() or "context windows" in w.lower()
+               for w in result["warnings"]), (
+        f"expected a WARNING about malformed context_windows; got {result['warnings']}"
+    )
+
+
+def test_rescan_picks_up_new_model_dir() -> None:
+    """Audit finding: discovery was startup-only; new models required
+    a restart. ``MLXManager.rescan()`` now picks them up.
+    """
+    snippet = """
+    import os, tempfile
+
+    tmp = tempfile.mkdtemp(prefix="test-mlx-rescan-")
+    os.makedirs(os.path.join(tmp, "alias-a"))
+    with open(os.path.join(tmp, "alias-a", "config.json"), "w") as f:
+        f.write("{}")
+
+    mgr = mod.MLXManager(tmp)
+    initial = sorted(mgr.get_available_aliases())
+
+    # Add a new model dir AFTER construction.
+    os.makedirs(os.path.join(tmp, "alias-b"))
+    with open(os.path.join(tmp, "alias-b", "config.json"), "w") as f:
+        f.write("{}")
+
+    diff = mgr.rescan()
+    after = sorted(mgr.get_available_aliases())
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "initial": initial,
+        "after": after,
+        "diff": diff,
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["initial"] == ["alias-a"]
+    assert result["after"] == ["alias-a", "alias-b"]
+    assert result["diff"]["added"] == ["alias-b"]
+    assert result["diff"]["removed"] == []
+    assert result["diff"]["unchanged"] == ["alias-a"]
+
+
+def test_rescan_drops_removed_alias_from_registry() -> None:
+    """A model dir removed from disk after startup must disappear
+    from the registry on next rescan. Loaded handles are unaffected
+    (operator-controlled eviction).
+    """
+    snippet = """
+    import os, tempfile, shutil
+
+    tmp = tempfile.mkdtemp(prefix="test-mlx-rescan-")
+    for n in ("alias-a", "alias-b"):
+        os.makedirs(os.path.join(tmp, n))
+        with open(os.path.join(tmp, n, "config.json"), "w") as f:
+            f.write("{}")
+
+    mgr = mod.MLXManager(tmp)
+    initial = sorted(mgr.get_available_aliases())
+
+    shutil.rmtree(os.path.join(tmp, "alias-b"))
+    diff = mgr.rescan()
+    after = sorted(mgr.get_available_aliases())
+
+    import json as _j
+    print("RESULT=" + _j.dumps({
+        "initial": initial, "after": after, "diff": diff,
+    }))
+    """
+    result = _run_mlx_subprocess(snippet)
+    assert result["initial"] == ["alias-a", "alias-b"]
+    assert result["after"] == ["alias-a"]
+    assert result["diff"]["removed"] == ["alias-b"]
+
+
 def test_get_recent_load_errors_empty_on_fresh_manager() -> None:
     """A freshly-constructed manager must have an empty load-error
     map (PR 6 contract sanity check from the discovery side).

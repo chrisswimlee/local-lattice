@@ -1123,24 +1123,112 @@ class MLXManager:
             log.warning("MLX root does not exist: %s", self.root_path)
             return
         log.info("Scanning MLX models in: %s", self.root_path)
-        for entry in os.scandir(self.root_path):
+        try:
+            entries = list(os.scandir(self.root_path))
+        except (PermissionError, OSError) as e:
+            # Audit finding: previously the root-level scandir failure
+            # would raise out of __init__ with a confusing stack trace.
+            # Now we log the path + exception and continue with an
+            # empty registry — operators see the cause without grep.
+            log.warning(
+                "MLX root scan failed for %s (%s); proceeding with empty registry",
+                self.root_path,
+                e,
+            )
+            return
+        for entry in entries:
             if not entry.is_dir():
                 continue
             cfg = os.path.join(entry.path, "config.json")
             if not os.path.exists(cfg):
                 # Could be a publisher dir with model subdirs (LM Studio layout).
                 try:
-                    for sub in os.scandir(entry.path):
-                        if sub.is_dir() and os.path.exists(os.path.join(sub.path, "config.json")):
-                            alias = f"{entry.name}/{sub.name}"
-                            self.registry[alias] = sub.path
-                            log.info("  Found: %s", alias)
-                except Exception:
-                    pass
+                    sub_entries = list(os.scandir(entry.path))
+                except (PermissionError, OSError) as e:
+                    # Audit finding: bare ``except Exception: pass``
+                    # used to swallow these silently — operators saw
+                    # "0 models found" with no clue why. Now logged
+                    # at WARNING with the publisher path + exception
+                    # type so the cause is obvious.
+                    log.warning(
+                        "Cannot scan publisher dir %s (%s); skipping",
+                        entry.path,
+                        e,
+                    )
+                    continue
+                for sub in sub_entries:
+                    if sub.is_dir() and os.path.exists(os.path.join(sub.path, "config.json")):
+                        alias = f"{entry.name}/{sub.name}"
+                        self.registry[alias] = sub.path
+                        log.info("  Found: %s", alias)
                 continue
             alias = entry.name
             self.registry[alias] = entry.path
             log.info("  Found: %s", alias)
+
+    def rescan(self) -> dict:
+        """Re-walk ``MLX_MODEL_ROOT`` to pick up models added or
+        removed on disk since startup. Loaded models stay loaded
+        (eviction is operator-controlled via DELETE /v1/models or
+        LRU pressure); only the registry is refreshed.
+
+        Returns a dict with ``added``, ``removed``, ``unchanged`` lists
+        of alias names so the dashboard / CLI caller can show a diff.
+
+        Audit finding: the original implementation only scanned once
+        at ``__init__``, so newly-downloaded models required a process
+        restart. ``rescan`` closes that gap without breaking the
+        startup-only invariant: existing aliases never change paths,
+        and loaded handles continue to work even if their alias
+        disappears from the registry.
+        """
+        old = set(self.registry.keys())
+        # Build a fresh registry into a temp dict, then atomically swap.
+        new_registry: dict[str, str] = {}
+        if not os.path.exists(self.root_path):
+            log.warning("MLX root does not exist on rescan: %s", self.root_path)
+        else:
+            try:
+                entries = list(os.scandir(self.root_path))
+            except (PermissionError, OSError) as e:
+                log.warning(
+                    "MLX root rescan failed for %s (%s); keeping current registry",
+                    self.root_path,
+                    e,
+                )
+                return {"added": [], "removed": [], "unchanged": sorted(old)}
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
+                cfg = os.path.join(entry.path, "config.json")
+                if not os.path.exists(cfg):
+                    try:
+                        sub_entries = list(os.scandir(entry.path))
+                    except (PermissionError, OSError) as e:
+                        log.warning(
+                            "Rescan cannot read publisher dir %s (%s); skipping",
+                            entry.path,
+                            e,
+                        )
+                        continue
+                    for sub in sub_entries:
+                        if sub.is_dir() and os.path.exists(os.path.join(sub.path, "config.json")):
+                            new_registry[f"{entry.name}/{sub.name}"] = sub.path
+                else:
+                    new_registry[entry.name] = entry.path
+
+        with self._registry_lock:
+            self.registry = new_registry
+
+        new = set(new_registry.keys())
+        added = sorted(new - old)
+        removed = sorted(old - new)
+        unchanged = sorted(new & old)
+        if added:
+            log.info("Rescan added: %s", added)
+        if removed:
+            log.info("Rescan removed from registry: %s", removed)
+        return {"added": added, "removed": removed, "unchanged": unchanged}
 
     def _load_context_windows(self):
         cfg = os.path.join(os.path.dirname(__file__), "mlx_context_windows.json")
@@ -1148,7 +1236,15 @@ class MLXManager:
             try:
                 with open(cfg, "r") as f:
                     self.context_windows = json.load(f)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                # Audit finding: previously swallowed silently → operators
+                # never knew their context-window hints weren't being
+                # applied. Log at WARNING with the path + exception.
+                log.warning(
+                    "Cannot load %s (%s); per-model context windows disabled",
+                    cfg,
+                    e,
+                )
                 self.context_windows = {}
 
     def get_available_aliases(self):
@@ -4641,9 +4737,21 @@ def main():
         )
 
     if chosen_root:
-        MLX_MODEL_ROOT = os.path.abspath(os.path.expanduser(chosen_root))
-        os.environ["MLX_MODEL_ROOT"] = MLX_MODEL_ROOT
-        mlx_manager = MLXManager(MLX_MODEL_ROOT)
+        new_root = os.path.abspath(os.path.expanduser(chosen_root))
+        if new_root != mlx_manager.root_path:
+            # Audit finding: main() used to unconditionally re-instantiate
+            # MLXManager even when chosen_root resolved to the same abspath
+            # as the import-time manager — wasting a full directory walk.
+            # Now we only rebuild when the path actually changes.
+            MLX_MODEL_ROOT = new_root
+            os.environ["MLX_MODEL_ROOT"] = MLX_MODEL_ROOT
+            mlx_manager = MLXManager(MLX_MODEL_ROOT)
+        else:
+            log.debug(
+                "main(): chosen_root %s already matches import-time mlx_manager; "
+                "skipping redundant MLXManager construction",
+                new_root,
+            )
 
     if not MLX_AVAILABLE:
         log.warning("mlx_lm is not installed. /v1/* and /swarm/* MLX paths will 503.")
