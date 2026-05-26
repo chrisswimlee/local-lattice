@@ -12,6 +12,49 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Fixed (MLX gateway: pin in-flight models against eviction races)
+
+Closes the audit's highest-severity correctness finding. The LRU
+registry used to happily evict a model while a long-running
+generation still held a reference to it, with two failure modes:
+
+1. **RAM cap violation.** With `MAX_CONCURRENT_MODELS=1`, a streaming
+   request holding model A plus a load of model B left both full
+   weight sets resident until the stream ended.
+2. **Per-alias serialization break.** After eviction + reload of the
+   same alias, a second resident copy was created with a different
+   `gen_lock`. Two generations could then race on different MLX
+   instances of what the caller thought was "the same model" — a
+   known cause of MLX KV-cache corruption.
+
+Changes:
+- New `MLXManager.acquire_inference_handle(alias)` context manager
+  and lower-level `pin_alias` / `release_pin` methods. Every
+  inference site now pins the alias for the duration of the call;
+  the streaming path uses the explicit `pin/release` pair so the
+  pin survives the function return that hands the SSE generator
+  back to Flask.
+- `_ensure_capacity_locked` now picks the oldest *unpinned* alias
+  as the eviction victim. If every resident alias is pinned, the
+  new load proceeds and exceeds the cap rather than deadlocking;
+  a WARNING is logged so operators see they need to raise
+  `MAX_CONCURRENT_MODELS` or reduce request concurrency.
+- `unload_model` now returns `{"unloaded": bool, "deferred": bool}`.
+  Unloading a pinned alias defers the actual drop until the last
+  holder releases (HTTP `DELETE /v1/models/<alias>` returns 202
+  Accepted in that case). The deferred eviction fires automatically
+  in `release_pin` — operators do not need to retry.
+- `_loading_locks` is now pruned on every eviction and unload,
+  closing the unbounded-growth finding.
+
+Tests: 8 new tests in `tests/test_mlx_loader.py`. Each runs in a
+subprocess with a mocked `_mlx_load_model` so no real MLX weights
+are touched. Tests cover: pin/release counter, eviction skipping
+pinned aliases, deferred-unload fires on release, no duplicate
+resident copy on reload-during-pin, `_loading_locks` pruning,
+all-pinned over-cap with warning, exception-cleanup of the
+inflight refcount, and unload-of-unloaded clean status.
+
 ### Changed (MLX gateway: boot validation + admission default flip)
 
 Closes the audit findings on boot-time correctness gaps and the
