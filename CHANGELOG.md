@@ -12,6 +12,32 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Added (MLX gateway: discovery hardening + runtime registry rescan)
+
+Closes the audit's discovery findings:
+
+- `MLXManager._scan` previously had a bare `except Exception: pass`
+  around publisher subdir scans, silently swallowing permission
+  errors and broken symlinks. Operators saw "0 models found" with
+  no clue why. Now logs at WARNING with the path and exception type.
+  Root-level scan failures are also caught and logged the same way.
+- `mlx_context_windows.json` malformed JSON used to be silently
+  swallowed → operators never knew their per-model context-window
+  hints weren't being applied. Now logs at WARNING.
+- Discovery was startup-only: new model dirs required restart. New
+  `MLXManager.rescan()` re-walks `MLX_MODEL_ROOT` and returns a
+  `{added, removed, unchanged}` diff. Loaded models stay loaded
+  (operator-controlled eviction); only the registry is refreshed.
+- New `POST /dashboard/api/admin/rescan` endpoint (auth-required)
+  triggers the rescan and returns the diff for dashboard / CLI use.
+- `main()` no longer re-instantiates `MLXManager` when the chosen
+  root resolves to the same abspath as the import-time manager —
+  avoids a redundant full directory walk on every CLI serve.
+
+Tests: 4 new tests in `tests/test_mlx_discovery.py` covering the
+permission-error WARNING, malformed-context-windows WARNING,
+rescan picking up new dirs, and rescan dropping removed dirs.
+
 ### Added (MLX gateway: focused test suites for discovery and admission)
 
 Closes the audit's "zero MLX-specific test coverage for core load/

@@ -342,6 +342,39 @@ def api_preferences():
     return Response(json.dumps({"ok": True, "preferences": prefs}), mimetype="application/json")
 
 
+@bp.route("/dashboard/api/admin/rescan", methods=["POST"])
+def api_admin_rescan():
+    """Re-walk MLX_MODEL_ROOT to pick up models added or removed on
+    disk since startup. Auth-required. Returns the {added, removed,
+    unchanged} diff so operators see what changed.
+    """
+    if not MLX_DASHBOARD_ENABLED:
+        return Response(json.dumps({"error": "dashboard disabled"}), status=404, mimetype="application/json")
+    denied = _require_api_auth()
+    if denied:
+        return denied
+    mgr = _CTX.get("mlx_manager")
+    if mgr is None or not hasattr(mgr, "rescan"):
+        return Response(
+            json.dumps({"error": "mlx_manager.rescan() not available"}),
+            status=503,
+            mimetype="application/json",
+        )
+    try:
+        diff = mgr.rescan()
+    except Exception as e:  # noqa: BLE001
+        return Response(
+            json.dumps({"error": f"rescan failed: {e}"}),
+            status=500,
+            mimetype="application/json",
+        )
+    return Response(
+        json.dumps({"ok": True, "diff": diff}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 @bp.route("/dashboard/api/models/load", methods=["POST"])
 def api_models_load():
     if not MLX_DASHBOARD_ENABLED:
