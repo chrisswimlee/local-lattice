@@ -227,7 +227,11 @@ MODEL_ROLES, MODEL_ROLES_SOURCE = _load_model_roles()
 # names that pre-Pass-3 callers (and tests) referenced at module level so
 # this is a pure relocation, not a behavior change. New code should import
 # from ``middle_layer.swarm`` directly.
-from middle_layer.swarm import (  # noqa: E402
+from middle_layer.swarm import (  # noqa: E402, F401
+    # F401 is global to this block on purpose: every name here is a
+    # back-compat re-export for pre-Pass-3 callers that historically
+    # imported from middle_layer.py. Use middle_layer.swarm directly
+    # in new code; this surface stays stable until 0.2.0.
     LM_STUDIO_PER_MODEL_INFLIGHT_CAP,
     MAX_PARALLEL_MODEL_CALLS,
     SWARM_CHAT_DEFAULT_JUDGE,
@@ -1236,7 +1240,8 @@ from middle_layer.swarm import (  # noqa: E402, F401
 )
 
 
-from middle_layer.swarm import (  # noqa: E402
+from middle_layer.swarm import (  # noqa: E402, F401
+    # Back-compat re-exports — see the block above.
     _SWARM_AUTO_TOKENS,
     _is_auto_swarm_token,
 )
@@ -1278,7 +1283,8 @@ def _expand_swarm_models(spec, available=None, *, apply_auto_cap: bool = False):
     )
 
 
-from middle_layer.swarm import (  # noqa: E402
+from middle_layer.swarm import (  # noqa: E402, F401
+    # Back-compat re-exports — see the block above.
     _SWARM_CHAT_CANONICAL,
     _SWARM_CHAT_INTENTS,
     _is_swarm_chat_model,
