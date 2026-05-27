@@ -78,7 +78,7 @@ import requests
 import copy
 import heapq
 from collections import OrderedDict, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from flask import Flask, request, Response, stream_with_context
 
 try:
