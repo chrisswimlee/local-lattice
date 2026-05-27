@@ -6,7 +6,7 @@ VENV  ?= .venv
 PIP   := $(VENV)/bin/pip
 PY    := $(VENV)/bin/python
 
-.PHONY: install install-mlx test lint fmt run run-mlx run-stable run-lmstudio docker clean
+.PHONY: install install-mlx test test-mlx test-all lint fmt run run-mlx run-stable run-lmstudio docker clean
 
 $(VENV)/bin/python:
 	$(PYTHON) -m venv $(VENV)
@@ -18,8 +18,19 @@ install: $(VENV)/bin/python
 install-mlx: $(VENV)/bin/python
 	$(PIP) install -e ".[mlx,anthropic,dashboard,dev]"
 
+# Default test target: fast suite (skips the slow MLX subprocess tests
+# and any network-dependent tests). Run before every commit. ~5-10s.
 test: $(VENV)/bin/python
-	$(PY) -m pytest $(PYTEST_ARGS)
+	$(PY) -m pytest -m "not mlx and not network" $(PYTEST_ARGS)
+
+# Opt-in MLX subprocess tests. Run when touching MLX gateway code
+# (middle_layerMLX.py, mlx_dashboard.py, mlx_manager). ~30-60s.
+test-mlx: $(VENV)/bin/python
+	$(PY) -m pytest -m "mlx and not network" $(PYTEST_ARGS)
+
+# Everything except network-dependent tests. ~40-70s.
+test-all: $(VENV)/bin/python
+	$(PY) -m pytest -m "not network" $(PYTEST_ARGS)
 
 lint: $(VENV)/bin/python
 	$(VENV)/bin/ruff check middle_layer

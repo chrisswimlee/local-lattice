@@ -11,7 +11,13 @@ All tests run in a subprocess so MLX init doesn't leak.
 
 from __future__ import annotations
 
+import pytest
+
 from tests._helpers import _run_mlx_subprocess
+
+# Subprocess-based MLX tests; skipped by default. See test_mlx_boot.py
+# header for the rationale.
+pytestmark = pytest.mark.mlx
 
 
 def test_admission_disabled_when_cap_zero_is_noop() -> None:

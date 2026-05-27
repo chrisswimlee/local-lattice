@@ -24,6 +24,10 @@ from tests._helpers import _run_mlx_subprocess
 # gateway. CI environments without mlx_lm still run them: the gateway
 # wraps ``import mlx_lm`` in try/except so MLX_AVAILABLE just becomes
 # False; for these tests we mock ``_mlx_load_model`` directly.
+#
+# Marked ``mlx`` so the default fast suite skips the subprocess cost;
+# opt in with ``make test-mlx`` or ``pytest -m mlx``.
+pytestmark = pytest.mark.mlx
 
 
 def _setup_fake_loader(num_loads_succeed: int = 99) -> str:

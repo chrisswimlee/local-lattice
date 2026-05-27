@@ -15,7 +15,13 @@ from __future__ import annotations
 import os
 import tempfile
 
+import pytest
+
 from tests._helpers import _run_mlx_subprocess
+
+# Subprocess-based MLX tests; skipped by default. See test_mlx_boot.py
+# header for the rationale.
+pytestmark = pytest.mark.mlx
 
 
 def _build_tree(root: str, layout: dict[str, str | None]) -> None:

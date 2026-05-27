@@ -230,8 +230,13 @@ def test_max_workers_explicit_value_warns_and_is_ignored() -> None:
     assert "upstream WSGI server" in proc.stderr
 
 
-# These tests run the gateway in a subprocess with a controlled env,
-# so they don't require mlx_lm to actually be importable — the gateway
-# wraps the mlx_lm import in try/except and degrades to
-# MLX_AVAILABLE=False. Boot validation runs regardless of MLX
-# availability, which is the point.
+# Subprocess-based MLX tests are marked ``mlx`` so the default
+# ``-m "not mlx and not network"`` invocation (Makefile default,
+# pyproject.toml default) skips them — they each spawn a fresh Python
+# interpreter to import middle_layerMLX, which dominates wall time
+# (~5-10s per file vs <1s for the rest of the suite). Run with
+# ``make test-mlx`` or ``pytest -m mlx`` when you've touched MLX code.
+#
+# They still don't *require* mlx_lm to be importable (the gateway
+# wraps that import in try/except), so they pass even on Linux CI.
+pytestmark = pytest.mark.mlx
