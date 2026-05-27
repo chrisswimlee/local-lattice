@@ -97,6 +97,57 @@ The dashboard is at `http://127.0.0.1:5001/dashboard/` (set the same API
 key in its sessionStorage prompt). Disable it with
 `MLX_DASHBOARD_ENABLED=0`.
 
+## Which gateway should I run?
+
+Local Lattice ships **two interchangeable gateways** that speak the same
+OpenAI-compatible HTTP surface. Pick one based on what you already have
+running on the box:
+
+| You have… | Run | Launcher | Port |
+|---|---|---|---|
+| **LM Studio installed and loading your models** | **`lmstudio` proxy** (recommended for most operators) | `./start_middle_layer.sh` or `./scripts/start.sh --profile lmstudio` | 5000 |
+| MLX-converted weights and no LM Studio | `mlx` direct gateway | `./start_middle_layerMLX.sh` or `./scripts/start.sh --profile mlx` | 5001 |
+| Memory-tight Mac running MoE / 70B+ models | `mlx` direct gateway in stable mode | `./scripts/start.sh --profile stable=safe` | 5001 |
+
+### Pick `lmstudio` when…
+
+- You already use LM Studio's UI as your model browser and download tool.
+- You want a separate OS process serving inference (crash isolation: a bad
+  load takes down LM Studio, not your gateway).
+- You're running mixed model formats (GGUF, MLX, EXL2) — LM Studio's
+  loader handles all of them; the MLX gateway only loads MLX weights.
+- You don't care about the ~3–10ms HTTP roundtrip overhead per request.
+
+This is the **primary path most operators want.** All the dynamic-by-
+default behavior (strict loaded-model policy, curated swarm fanout)
+lands here automatically when you use the launcher.
+
+### Pick `mlx` when…
+
+- You're running pure Apple-Silicon MLX models and want the lowest
+  per-request latency (no HTTP hop, direct `mlx_lm.generate`).
+- You want to ship MiddleLayer as a self-contained unit without
+  requiring operators to install LM Studio separately.
+- You need fine-grained in-process control over model lifecycle
+  (programmatic load/unload, per-alias admission caps, real-time
+  Metal-allocator hints).
+- You're benchmarking — MLX shaves first-token latency on streaming
+  endpoints.
+
+The MLX gateway can run side-by-side with the LM Studio gateway on a
+different port if you want both options available without switching.
+
+### Pick `stable` when…
+
+- You're on a memory-tight Mac (16 GB) and a single inference job can
+  consume most of RAM. The stable profile tunes
+  `MAX_CONCURRENT_MODELS=1`, `MAX_PARALLEL_MODEL_CALLS=1`,
+  `MLX_PER_MODEL_INFLIGHT_CAP=1` and trims queue and token caps so
+  the runtime never tries to coexist a second model with the first.
+- Use `--profile stable=safe` (most conservative),
+  `--profile stable=balanced`, or `--profile stable=faster` for the
+  three pre-tuned tiers.
+
 ## How it compares
 
 | Capability                                       | Local Lattice | `mlx_lm.server` | Ollama | LM Studio | LiteLLM |

@@ -4,7 +4,13 @@ TimeoutError handler removal (PR 5 of the audit hardening plan).
 
 from __future__ import annotations
 
+import pytest
+
 from tests._helpers import _run_mlx_subprocess
+
+# Subprocess-based MLX tests; skipped by default. See test_mlx_boot.py
+# header for the rationale.
+pytestmark = pytest.mark.mlx
 
 
 def test_healthz_advertises_generation_advisory_timeout_sec() -> None:
