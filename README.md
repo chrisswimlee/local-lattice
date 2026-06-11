@@ -1,29 +1,68 @@
 <!-- README -->
 
-# MiddleLayer
+# Local Lattice
 
-**MLX-native OpenAI-compatible gateway with capability routing, an admission
-queue, and a hybrid local-plus-cloud swarm — built for Apple Silicon.**
+**The capability layer between your agents and your LLM compute. Agents
+describe what they need; Lattice picks the right model, routes, swarms, and
+falls back. One OpenAI-compatible API, local-first.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Project status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+[![Project status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status-and-roadmap)
 
 **Canonical repository:** [github.com/chrisswimlee/local-lattice](https://github.com/chrisswimlee/local-lattice).
 The PyPI distribution name is **`local-lattice`**; the importable Python package remains **`middle_layer`** until Pass 3.
 
-MiddleLayer is a small Flask server that speaks the OpenAI HTTP API but runs
-your models directly via [Apple `mlx_lm`](https://github.com/ml-explore/mlx).
-On top of that it adds the production-shaped pieces an everyday inference
-gateway needs but `mlx_lm.server` does not: capability-aware model routing, a
-bounded admission queue with per-model concurrency caps, a hybrid local-plus-
-cloud "swarm" (`/swarm/fanout|vote|pipeline|debate`), an in-process metrics
-dashboard, and optional escalation to Anthropic Claude for long-form work.
+## The problem
+
+Every agent framework hardcodes models. You write `model="gpt-4o"` or
+`model="qwen2.5-coder-32b-instruct"` and ship it. The agent breaks when:
+
+- the user has different models on disk,
+- the operator wants to swap providers without redeploying,
+- a small local model could have answered, but the agent went straight to
+  the cloud anyway,
+- one model wasn't enough and you needed a second opinion.
+
+Agents shouldn't know model identifiers. They should declare **capabilities**
+(`role:coder`, `role:reasoner`, vision, long context, low latency), and the
+infrastructure should pick the best available local model — or fall back to
+cloud — without the agent code changing.
+
+## What Local Lattice is
+
+A small Flask server that speaks the **OpenAI HTTP API** and adds a capability
+layer on top of it:
+
+- **Capability-based resolution.** `model="role:coder"`, priority lists
+  (`"model-a,model-b,fallback"`), wildcards (`"*coder*"`), and automatic
+  routing on vision content, prompt length, and a `X-MLX-Latency-Tier`
+  header. Backed by [`mlx_roles.json`](./mlx_roles.json) and
+  [`model_profiles.json`](./model_profiles.json) — see
+  [`docs/capabilities.md`](./docs/capabilities.md) for the full grammar.
+- **Swarm primitives, exposed as HTTP routes.** `/swarm/fanout`,
+  `/swarm/vote`, `/swarm/pipeline`, `/swarm/debate` — let an agent ask for
+  N opinions, a moderated vote, a sequential pipeline, or a multi-round
+  debate without writing the orchestration itself.
+- **Direct MLX execution on Apple Silicon** via
+  [`mlx_lm`](https://github.com/ml-explore/mlx), with an LM Studio proxy
+  backend for Linux / x86. Adding more backends (vLLM, llama.cpp) is on
+  the roadmap.
+- **Hybrid local-plus-cloud.** Optional escalation to Anthropic Claude
+  when a request exceeds local capacity or requests it explicitly.
+- **Production-shaped ops.** Multi-model LRU, per-model concurrency caps,
+  bounded admission queue with priority and retry-after, and an in-process
+  metrics dashboard at `/dashboard/`.
+
+The HTTP shape is just OpenAI. Any agent framework that can point at a custom
+OpenAI base URL works — see [`docs/integrations/`](./docs/integrations/) for
+LangGraph and OpenAI Agents SDK examples.
 
 > **Status (0.2.0): alpha.** The HTTP surface is stable in practice (every
 > route is pinned by `docs/_internal/baseline/` regression captures) but the
 > Python API and internal module layout will change before 1.0. Pin the
-> version if you embed this.
+> version if you embed this. See [`docs/why-lattice.md`](./docs/why-lattice.md)
+> for the longer "why this exists" story.
 
 ## 30-second quickstart
 
@@ -58,24 +97,77 @@ The dashboard is at `http://127.0.0.1:5001/dashboard/` (set the same API
 key in its sessionStorage prompt). Disable it with
 `MLX_DASHBOARD_ENABLED=0`.
 
-## What you get
+## Which gateway should I run?
 
-| Capability                                  | MiddleLayer | `mlx_lm.server` | Ollama | LM Studio | LiteLLM |
-|---------------------------------------------|:-----------:|:---------------:|:------:|:---------:|:-------:|
-| OpenAI `/v1/chat/completions` + `/v1/models`|    ✅        |        ✅          |   ✅     |    ✅       |    ✅      |
-| Streaming SSE (`data: ... [DONE]`)          |    ✅        |        ✅          |   ✅     |    ✅       |    ✅      |
-| Direct MLX execution (no LM Studio needed)  |    ✅        |        ✅          |   —      |     —      |     —      |
-| Multi-model LRU + per-model concurrency cap |    ✅        |        —           |   ✅     |    ✅       |     —      |
-| Capability routing (`role:coder`, latency tier) | ✅      |        —           |   —      |     —      |     ~      |
-| Admission queue with priority + retry-after |    ✅        |        —           |   —      |     —      |     —      |
-| Swarm: fanout / vote / pipeline / debate    |    ✅        |        —           |   —      |     —      |     —      |
-| Optional Anthropic Opus escalation          |    ✅        |        —           |   —      |     —      |     ✅      |
-| In-process observability dashboard          |    ✅        |        —           |   —      |     —      |     —      |
-| `pip install`, OpenAI-compatible API key auth |   ✅       |        —           |   —      |     —      |     ✅      |
+Local Lattice ships **two interchangeable gateways** that speak the same
+OpenAI-compatible HTTP surface. Pick one based on what you already have
+running on the box:
 
-The gateway is **not** a replacement for `mlx_lm.server` — it sits in front
-of `mlx_lm` and adds operator-shaped behaviour. If you only need a single
-model with raw throughput, prefer `mlx_lm.server`.
+| You have… | Run | Launcher | Port |
+|---|---|---|---|
+| **LM Studio installed and loading your models** | **`lmstudio` proxy** (recommended for most operators) | `./start_middle_layer.sh` or `./scripts/start.sh --profile lmstudio` | 5000 |
+| MLX-converted weights and no LM Studio | `mlx` direct gateway | `./start_middle_layerMLX.sh` or `./scripts/start.sh --profile mlx` | 5001 |
+| Memory-tight Mac running MoE / 70B+ models | `mlx` direct gateway in stable mode | `./scripts/start.sh --profile stable=safe` | 5001 |
+
+### Pick `lmstudio` when…
+
+- You already use LM Studio's UI as your model browser and download tool.
+- You want a separate OS process serving inference (crash isolation: a bad
+  load takes down LM Studio, not your gateway).
+- You're running mixed model formats (GGUF, MLX, EXL2) — LM Studio's
+  loader handles all of them; the MLX gateway only loads MLX weights.
+- You don't care about the ~3–10ms HTTP roundtrip overhead per request.
+
+This is the **primary path most operators want.** All the dynamic-by-
+default behavior (strict loaded-model policy, curated swarm fanout)
+lands here automatically when you use the launcher.
+
+### Pick `mlx` when…
+
+- You're running pure Apple-Silicon MLX models and want the lowest
+  per-request latency (no HTTP hop, direct `mlx_lm.generate`).
+- You want to ship MiddleLayer as a self-contained unit without
+  requiring operators to install LM Studio separately.
+- You need fine-grained in-process control over model lifecycle
+  (programmatic load/unload, per-alias admission caps, real-time
+  Metal-allocator hints).
+- You're benchmarking — MLX shaves first-token latency on streaming
+  endpoints.
+
+The MLX gateway can run side-by-side with the LM Studio gateway on a
+different port if you want both options available without switching.
+
+### Pick `stable` when…
+
+- You're on a memory-tight Mac (16 GB) and a single inference job can
+  consume most of RAM. The stable profile tunes
+  `MAX_CONCURRENT_MODELS=1`, `MAX_PARALLEL_MODEL_CALLS=1`,
+  `MLX_PER_MODEL_INFLIGHT_CAP=1` and trims queue and token caps so
+  the runtime never tries to coexist a second model with the first.
+- Use `--profile stable=safe` (most conservative),
+  `--profile stable=balanced`, or `--profile stable=faster` for the
+  three pre-tuned tiers.
+
+## How it compares
+
+| Capability                                       | Local Lattice | `mlx_lm.server` | Ollama | LM Studio | LiteLLM |
+|--------------------------------------------------|:-------------:|:---------------:|:------:|:---------:|:-------:|
+| OpenAI `/v1/chat/completions` + `/v1/models`     |     ✅         |        ✅          |   ✅     |    ✅       |    ✅      |
+| Streaming SSE (`data: ... [DONE]`)               |     ✅         |        ✅          |   ✅     |    ✅       |    ✅      |
+| Capability routing (`role:coder`, vision, tier)  |     ✅         |        —           |   —      |     —      |     ~      |
+| Auto-routing on prompt content (vision/long ctx) |     ✅         |        —           |   —      |     —      |     —      |
+| Swarm: fanout / vote / pipeline / debate         |     ✅         |        —           |   —      |     —      |     —      |
+| Hybrid local + cloud (Anthropic escalation)      |     ✅         |        —           |   —      |     —      |     ✅      |
+| Direct MLX execution on Apple Silicon            |     ✅         |        ✅          |   —      |     —      |     —      |
+| Multi-model LRU + per-model concurrency cap      |     ✅         |        —           |   ✅     |    ✅       |     —      |
+| Admission queue with priority + retry-after      |     ✅         |        —           |   —      |     —      |     —      |
+| In-process observability dashboard               |     ✅         |        —           |   —      |     —      |     —      |
+| `pip install`, OpenAI-compatible API key auth    |     ✅         |        —           |   —      |     —      |     ✅      |
+
+Local Lattice is **not** a replacement for `mlx_lm.server` or Ollama — it sits
+*in front of* them and adds the capability layer that lets agent code stop
+caring which model is running. If you only need a single model with raw
+throughput, prefer the underlying runtime directly.
 
 ## Installing
 
@@ -133,15 +225,22 @@ Quick reference of the most common knobs:
 
 | Env var                     | Default     | What it does                                            |
 |-----------------------------|-------------|---------------------------------------------------------|
-| `HOST`                      | `127.0.0.1` | Bind address. Stay local unless you have auth on.       |
+| `HOST`                      | `127.0.0.1` | Bind address. Refuses to start on a public interface without `MIDDLE_LAYER_API_KEY`. |
 | `PORT`                      | `5001`      | TCP port for the gateway.                               |
-| `MIDDLE_LAYER_API_KEY`      | _(unset)_   | If set, every request needs `X-API-Key` or `Bearer`.    |
+| `MIDDLE_LAYER_API_KEY`      | _(unset)_   | If set, every request needs `X-API-Key` or `Bearer`. Compared constant-time. |
+| `MIDDLE_LAYER_ALLOW_PUBLIC_NO_AUTH` | _(unset)_ | Override the public-bind safety check. Use only behind a trusted auth-enforcing proxy. |
+| `MIDDLE_LAYER_MAX_REQUEST_BYTES` | `10485760` | Max HTTP request body in bytes (default 10 MiB).      |
 | `MLX_MODEL_ROOT`            | auto        | Where to look for MLX model directories.                |
 | `DEFAULT_MODEL`             | _(empty)_   | Alias returned for `model: ""`/`auto`/`default`.        |
 | `MAX_CONCURRENT_MODELS`     | `2`         | LRU bound on resident MLX models.                       |
 | `MAX_PARALLEL_MODEL_CALLS`  | `2`         | Global concurrent-generation cap.                       |
-| `MLX_PER_MODEL_INFLIGHT_CAP`| `0` (∞)     | Per-alias generation cap.                               |
+| `MLX_PER_MODEL_INFLIGHT_CAP`| `1`         | Per-alias generation cap (MLX gateway). `0` disables admission (legacy; emits `DeprecationWarning` when unset before 0.2.0). |
+| `MLX_FORCE_GC_ON_EVICT`     | `0`         | When `1`, run `gc.collect()` after every MLX eviction in addition to the Metal-cache release. Tighter peak RSS on memory-tight Macs at the cost of small extra wall-clock latency per swap. |
 | `EXTRA_PLACEHOLDER_MODELS`  | _(unset → legacy OpenClaw set + `DeprecationWarning`)_ | Comma-separated extra "you pick" aliases; set to empty to exclude legacy ids. |
+| `PREFER_LOADED_MODELS`      | `strict`    | LM Studio gateway loaded-id policy. `strict` never JIT-loads installed-but-not-loaded ids; `1` falls back to the installed set on a miss; `0` ignores loaded vs installed. Unset emits a `DeprecationWarning` (legacy default was `1`). |
+| `SWARM_CHAT_DEFAULT_MODELS` | `auto`      | Default `swarm.models` list when a swarm chat request omits it. `auto`/`loaded`/`*` expand to the currently-loaded chat-capable set (filtered to exclude embedding models, capped at `SWARM_CHAT_AUTO_MAX`); or a comma-separated list of ids/`role:*` lookups. Unset emits a `DeprecationWarning` (legacy default was `role:reasoner,role:coder,role:fast`). |
+| `SWARM_CHAT_AUTO_MAX`       | `3`         | Cap on how many loaded ids the `auto` sentinel contributes to a default-shaped swarm. Keeps fanout-vs-latency reasonable on boxes with many loaded models. Set to `0` to disable the cap. Dedicated `/swarm/fanout` HTTP endpoint ignores this. |
+| `SWARM_CHAT_DEFAULT_STRATEGY` | `best-of-n` | Default swarm winner-pick when the request omits `swarm.strategy`. `best-of-n` (judge picks from candidates), `first-success` (returns on first temporally successful agent, cancels pending peers), `longest`, `fanout`. |
 | `ANTHROPIC_API_KEY`         | _(unset)_   | Enables optional Claude escalation for long tasks.      |
 | `ANTHROPIC_AUTO_ROUTE`      | `1`         | Auto-escalate big tasks. Will default off in 0.2.0.     |
 | `MLX_DASHBOARD_ENABLED`     | `1`         | Mount the in-process dashboard at `/dashboard/`.        |
@@ -149,24 +248,48 @@ Quick reference of the most common knobs:
 
 ## Security defaults (deny-by-default)
 
-- **Auth on, listen local.** `HOST=127.0.0.1` and `MIDDLE_LAYER_API_KEY`
-  is the supported posture for any host that is not a developer laptop.
-  Pass 4 will refuse to start when bound to a public interface without
-  an API key.
+- **Constant-time API key check.** Both gateway backends and the
+  dashboard compare keys with `hmac.compare_digest`. Send the key as
+  either `X-API-Key: <key>` or `Authorization: Bearer <key>`.
+- **Refuse to bind public without auth.** Starting on a non-loopback
+  interface without `MIDDLE_LAYER_API_KEY` set exits with a clear error.
+  Override with `MIDDLE_LAYER_ALLOW_PUBLIC_NO_AUTH=1` only when an
+  upstream proxy is enforcing authentication.
+- **Request body size cap.** Default 10 MiB; tune with
+  `MIDDLE_LAYER_MAX_REQUEST_BYTES`. Oversize requests get a Flask-native
+  413.
+- **Standard hardening headers** on every response:
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin`.
+  Dashboard responses additionally carry a strict
+  `Content-Security-Policy` that disallows inline scripts and remote
+  sources.
+- **Dashboard model-load allowlist.** `/dashboard/api/models/load` only
+  accepts aliases that pass a syntactic filter *and* appear in the live
+  on-disk model set discovered by the MLX manager.
 - **CORS off.** Set `CORS_ORIGINS=https://your.app` to allowlist a
-  specific origin. `*` is accepted today but will fail loudly when
-  combined with credentials in Pass 4.
+  specific origin. `*` is accepted today but is rejected when combined
+  with credentials.
 - **Prompt logging off.** `MLX_DASHBOARD_CAPTURE_PROMPTS=0`. Turning it
   on stores recent user prompts in process memory only (never to disk
-  in this release); a regex redactor is on the Pass-4 roadmap.
-- **API key comparison is being moved to `hmac.compare_digest`** in
-  Pass 4 (currently `!=` — flagged as RISK_REGISTER P4-02).
+  in this release); a regex redactor is on the Pass-5+ roadmap.
+
+Still open and tracked for future passes: per-IP rate limiting, HSTS
+guidance behind TLS, and CSP nonce-mode for the dashboard. See the
+[hardening roadmap](./SECURITY.md#hardening-roadmap) for the full list.
 
 A full threat model and the responsible-disclosure address live in
 [SECURITY.md](./SECURITY.md).
 
 ## Docs
 
+- [`docs/why-lattice.md`](./docs/why-lattice.md) — the longer "why this
+  exists" story: capability routing as an agent-infra primitive.
+- [`docs/capabilities.md`](./docs/capabilities.md) — formal spec of the
+  capability protocol: resolver grammar, role registry, auto-routing,
+  swarm endpoint contracts.
+- [`docs/integrations/`](./docs/integrations/) — drop-in examples for
+  LangGraph, OpenAI Agents SDK, and other agent frameworks.
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — dev loop, commits, tests.
 - [SECURITY.md](./SECURITY.md) — vulnerability reporting.
 - [CHANGELOG.md](./CHANGELOG.md) — semver-shaped release notes.

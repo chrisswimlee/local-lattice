@@ -1,33 +1,38 @@
 {
-  "_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing model wins. Exact ids beat substrings (substring 'fast' would also match e.g. 'fast-7b' if it existed). Tune to your loaded set.",
+  "_comment": "Resolver roles for middle_layer.py and middle_layerMLX.py. Each list is checked in order; first existing alias (substring match against mlx_manager.get_available_aliases()) wins. Tune to your loaded set. Auto-generated from ~/.lmstudio/models on 2026-05-15.",
 
   "fast": [
-    "nemotron-mini-4b-instruct-mlx",
-    "gemma-4-e4b-it-optiq",
-    "granite-4.1-8b",
-    "qwen3.5-9b-optiq"
+    "mlx-community/granite-4.1-8b-6bit",
+    "mlx-community/Qwen3.5-9B-OptiQ-4bit",
+    "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
   ],
 
   "coder": [
-    "qwen/qwen3-coder-next",
+    "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
+    "Qwen3-Coder",
     "coder"
   ],
 
   "reasoner": [
-    "qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking",
-    "nousresearch/hermes-4-70b",
-    "openai/gpt-oss-20b",
-    "granite-4.1-30b"
+    "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
+    "lmstudio-community/Hermes-4-70B-MLX-4bit",
+    "mlx-community/gpt-oss-120b-mxfp4-bf16",
+    "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-4bit",
+    "mlx-community/Qwen3.5-122B-A10B-5bit",
+    "mlx-community/granite-4.1-30b-8bit"
   ],
 
   "vision": [
-    "vl",
-    "vision",
-    "llava"
+    "mlx-community/Qwen3.6-27B-8bit",
+    "mlx-community/gemma-4-31b-it-8bit",
+    "mlx-community/Qwen3.5-9B-OptiQ-4bit",
+    "mlx-community/Qwen3.6-35B-A3B-8bit",
+    "mlx-community/gemma-4-26b-a4b-it-8bit",
+    "mlx-community/Qwen3.5-122B-A10B-5bit"
   ],
 
   "default": [
-    "granite-4.1-8b",
-    "qwen3.5-9b-optiq"
+    "mlx-community/granite-4.1-8b-6bit",
+    "mlx-community/Qwen3.5-9B-OptiQ-4bit"
   ]
 }

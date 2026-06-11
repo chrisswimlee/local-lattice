@@ -101,7 +101,6 @@ case "$PROFILE" in
       safe)
         : "${MAX_CONCURRENT_MODELS:=1}"
         : "${MAX_PARALLEL_MODEL_CALLS:=1}"
-        : "${MAX_WORKERS:=1}"
         : "${MLX_PER_MODEL_INFLIGHT_CAP:=1}"
         : "${MLX_QUEUE_MAX_PER_MODEL:=8}"
         : "${MLX_QUEUE_MAX_TOTAL:=16}"
@@ -111,7 +110,6 @@ case "$PROFILE" in
       balanced)
         : "${MAX_CONCURRENT_MODELS:=1}"
         : "${MAX_PARALLEL_MODEL_CALLS:=2}"
-        : "${MAX_WORKERS:=2}"
         : "${MLX_PER_MODEL_INFLIGHT_CAP:=1}"
         : "${MLX_QUEUE_MAX_PER_MODEL:=12}"
         : "${MLX_QUEUE_MAX_TOTAL:=24}"
@@ -121,7 +119,6 @@ case "$PROFILE" in
       faster)
         : "${MAX_CONCURRENT_MODELS:=1}"
         : "${MAX_PARALLEL_MODEL_CALLS:=2}"
-        : "${MAX_WORKERS:=2}"
         : "${MLX_PER_MODEL_INFLIGHT_CAP:=1}"
         : "${MLX_QUEUE_MAX_PER_MODEL:=16}"
         : "${MLX_QUEUE_MAX_TOTAL:=32}"
@@ -129,7 +126,7 @@ case "$PROFILE" in
         : "${MAX_TOKENS_CEILING:=4096}"
         ;;
     esac
-    export MAX_CONCURRENT_MODELS MAX_PARALLEL_MODEL_CALLS MAX_WORKERS
+    export MAX_CONCURRENT_MODELS MAX_PARALLEL_MODEL_CALLS
     export MLX_PER_MODEL_INFLIGHT_CAP MLX_QUEUE_MAX_PER_MODEL MLX_QUEUE_MAX_TOTAL
     export DEFAULT_MAX_TOKENS MAX_TOKENS_CEILING
     export MLX_QUEUE_WAIT_TIMEOUT_SEC="${MLX_QUEUE_WAIT_TIMEOUT_SEC:-20}"
@@ -166,18 +163,37 @@ case "$PROFILE" in
       echo "middle_layer_venv not found under $ws_root or $REPO_ROOT" >&2
       exit 1
     fi
-    export TARGET_MODEL="${TARGET_MODEL:-qwen/qwen3.5-35b-a3b}"
+    # Dynamic-by-default: don't pin TARGET_MODEL/DEFAULT_MODEL to a specific id
+    # so MiddleLayer picks whatever LM Studio currently has loaded. Operators
+    # who want a specific default can still export TARGET_MODEL / DEFAULT_MODEL
+    # before running this script.
+    export TARGET_MODEL="${TARGET_MODEL:-}"
     export DEFAULT_MODEL="${DEFAULT_MODEL:-$TARGET_MODEL}"
     export LM_STUDIO_URL="${LM_STUDIO_URL:-http://127.0.0.1:1234}"
     export PORT="${PORT:-5000}"
+    # Refuse to JIT-load installed-but-not-loaded models. With this set,
+    # roles, DEFAULT_MODEL, and swarm fanouts only ever pick from LM Studio's
+    # currently-loaded set. Set PREFER_LOADED_MODELS=1 (or 0) to disable.
+    export PREFER_LOADED_MODELS="${PREFER_LOADED_MODELS:-strict}"
+    # Default the swarm fanout to whatever's loaded ("auto" expands to the
+    # current loaded set at request time) so swarmCouncil / swarmIntelligence
+    # never tries to spin up role:reasoner+role:coder+role:fast as three
+    # separate JIT loads.
+    export SWARM_CHAT_DEFAULT_MODELS="${SWARM_CHAT_DEFAULT_MODELS:-auto}"
+    export SWARM_CHAT_DEFAULT_STRATEGY="${SWARM_CHAT_DEFAULT_STRATEGY:-first-success}"
+    # Prefer LM-Studio-shaped role file (short ids) over the MLX one (long
+    # mlx-community/lmstudio-community paths) — the LM Studio gateway resolves
+    # against /v1/models which returns short ids, so substring matches in
+    # mlx_roles.json never hit and the resolver falls through to the in-code
+    # default DEFAULT_MODEL_ROLES (which can JIT-load oversize models).
     if [[ -z "${MODEL_ROLES_FILE:-}" ]]; then
-      if [[ -f "$REPO_ROOT/mlx_roles.json" ]]; then export MODEL_ROLES_FILE="$REPO_ROOT/mlx_roles.json"
-      elif [[ -f "$ws_root/mlx_roles.json" ]]; then export MODEL_ROLES_FILE="$ws_root/mlx_roles.json"
+      if   [[ -f "$REPO_ROOT/lmstudio_roles.json" ]]; then export MODEL_ROLES_FILE="$REPO_ROOT/lmstudio_roles.json"
+      elif [[ -f "$ws_root/lmstudio_roles.json" ]];  then export MODEL_ROLES_FILE="$ws_root/lmstudio_roles.json"
+      elif [[ -f "$REPO_ROOT/mlx_roles.json" ]];     then export MODEL_ROLES_FILE="$REPO_ROOT/mlx_roles.json"
+      elif [[ -f "$ws_root/mlx_roles.json" ]];       then export MODEL_ROLES_FILE="$ws_root/mlx_roles.json"
       fi
     fi
     export MAX_PARALLEL_MODEL_CALLS="${MAX_PARALLEL_MODEL_CALLS:-1}"
-    export SWARM_CHAT_DEFAULT_MODELS="${SWARM_CHAT_DEFAULT_MODELS:-role:fast}"
-    export SWARM_CHAT_DEFAULT_STRATEGY="${SWARM_CHAT_DEFAULT_STRATEGY:-first-success}"
     echo "MiddleLayer (profile=lmstudio) — PORT=$PORT LM_STUDIO_URL=$LM_STUDIO_URL"
     if command -v local-lattice-lmstudio >/dev/null 2>&1; then
       exec local-lattice-lmstudio "${FORWARD[@]}"

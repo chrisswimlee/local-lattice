@@ -73,11 +73,12 @@ import uuid
 import logging
 import threading
 import argparse
+import contextlib
 import requests
 import copy
 import heapq
 from collections import OrderedDict, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from flask import Flask, request, Response, stream_with_context
 
 try:
@@ -90,6 +91,32 @@ try:
     from flask_cors import CORS as _FlaskCORS
 except ImportError:
     _FlaskCORS = None
+
+# --- Shared security helpers (Pass 4) -----------------------------------------
+from middle_layer.security import apply_security_headers as _apply_security_headers  # noqa: E402
+from middle_layer.security import check_api_key as _check_api_key  # noqa: E402
+from middle_layer.security import enforce_safe_bind as _enforce_safe_bind  # noqa: E402
+from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError  # noqa: E402
+from middle_layer.security import resolve_max_request_bytes as _resolve_max_request_bytes  # noqa: E402
+
+# --- Shared swarm primitives (Pass 3) -----------------------------------------
+# The MLX gateway shares the error classifier, intent map, structured
+# failure summarizer, and SSE generator with the LM Studio gateway. The IO
+# runners (run_one_agent / fanout / run_swarm_chat_completion) stay
+# MLX-specific because MLX has its own admission scheduler, fanout
+# deadline, and judge-verdict parser that don't belong in the shared module.
+from middle_layer.swarm import (  # noqa: E402, F401
+    classify_swarm_error as _classify_swarm_error,
+    extract_upstream_status as _extract_upstream_status,
+    spec_to_agent_id as _spec_to_agent_id,
+    strip_upstream_prefix as _strip_upstream_prefix,
+    summarize_failed_candidates as _summarize_failed_candidates,
+    swarm_chat_intent as _swarm_chat_intent,
+    swarm_response_headers as _swarm_response_headers,
+    SWARM_CHAT_CANONICAL as _SWARM_CHAT_CANONICAL,
+    SWARM_CHAT_INTENTS as _SWARM_CHAT_INTENTS,
+    SWARM_ERROR_KINDS as _SWARM_ERROR_KINDS,
+)
 
 # --- MLX (optional but expected) ---------------------------------------------
 try:
@@ -117,6 +144,7 @@ logging.basicConfig(
 log = logging.getLogger("middle_layerMLX")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = _resolve_max_request_bytes()
 
 # =============================================================================
 # CONFIGURATION
@@ -159,7 +187,26 @@ MIDDLE_LAYER_API_KEY = os.environ.get("MIDDLE_LAYER_API_KEY")
 # MLX residency / concurrency
 MAX_CONCURRENT_MODELS = int(os.environ.get("MAX_CONCURRENT_MODELS", "2"))
 PRELOAD_MODELS = [s.strip() for s in os.environ.get("PRELOAD_MODELS", "").split(",") if s.strip()]
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))  # Flask threads via app.run(threaded=True)
+
+# Historical knob. Was advertised as "Flask threads" but never wired —
+# ``app.run(host, port, threaded=True)`` doesn't take a worker cap, and
+# this value was only logged. Real production concurrency is a job for
+# the upstream WSGI server. Kept for one minor as a no-op with a
+# ``DeprecationWarning`` when explicitly set, per AGENTS.md rule 1.
+_MAX_WORKERS_ENV = os.environ.get("MAX_WORKERS")
+if _MAX_WORKERS_ENV is not None:
+    warnings.warn(
+        "MAX_WORKERS is no longer honored: Flask's threaded=True does not "
+        "take a worker cap, and this knob was only logged. Configure your "
+        "upstream WSGI server (gunicorn --workers, uvicorn --workers, etc.) "
+        "instead. The env var is ignored and will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+# Kept as a module-level symbol so any downstream import (notably the
+# legacy startup banner) doesn't NameError mid-deprecation. Always 0
+# (== "no in-process cap"). Do not read this for any new logic.
+MAX_WORKERS = 0
 
 # Swarm / multi-agent knobs
 MAX_PARALLEL_MODEL_CALLS = int(os.environ.get("MAX_PARALLEL_MODEL_CALLS", "2"))
@@ -199,11 +246,44 @@ MLX_CONTEXT_TRIM_BUFFER = int(os.environ.get("MLX_CONTEXT_TRIM_BUFFER", "8"))
 # Rough pre-resolve prompt size for routing (chars / ratio ≈ tokens).
 MLX_ROUTE_LONG_PROMPT_CHARS = int(os.environ.get("MLX_ROUTE_LONG_PROMPT_CHARS", "48000"))
 
-# Per-model in-flight generation cap. Keep MLX_PER_MODEL_ADMISSION_CAP for backwards compatibility.
-_legacy_admission_cap = int(os.environ.get("MLX_PER_MODEL_ADMISSION_CAP", "0"))
-MLX_PER_MODEL_INFLIGHT_CAP = int(
-    os.environ.get("MLX_PER_MODEL_INFLIGHT_CAP", str(_legacy_admission_cap))
-)
+# Per-model in-flight generation cap. Default changed in 0.1.x from 0
+# (admission scheduler bypassed entirely) to 1 (one inference per alias,
+# match the stable launcher). Direct ``python middle_layerMLX.py``
+# invocations now get back-pressure by default instead of unbounded
+# thread pile-up on ``gen_lock``. AGENTS.md rule 1: emit a one-shot
+# ``DeprecationWarning`` when unset so operators can pin the legacy
+# behavior with ``MLX_PER_MODEL_INFLIGHT_CAP=0``.
+#
+# ``MLX_PER_MODEL_ADMISSION_CAP`` is the historical name; honored as a
+# fallback for one minor with a separate warning.
+_legacy_admission_cap_raw = os.environ.get("MLX_PER_MODEL_ADMISSION_CAP")
+if _legacy_admission_cap_raw is not None:
+    warnings.warn(
+        "MLX_PER_MODEL_ADMISSION_CAP is deprecated; use "
+        "MLX_PER_MODEL_INFLIGHT_CAP. Honored as a fallback for now; "
+        "will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+_legacy_admission_cap = int(_legacy_admission_cap_raw or "0")
+
+_inflight_cap_env = os.environ.get("MLX_PER_MODEL_INFLIGHT_CAP")
+if _inflight_cap_env is None and _legacy_admission_cap_raw is None:
+    warnings.warn(
+        "MLX_PER_MODEL_INFLIGHT_CAP is unset: defaulting to 1 (was 0). "
+        "MLX gateway now applies per-alias admission control by default "
+        "so direct invocations get the same back-pressure as the stable "
+        "launcher. Set MLX_PER_MODEL_INFLIGHT_CAP=0 explicitly to keep "
+        "the legacy 'no admission, rely only on gen_lock' behavior; "
+        "will be removed in 0.2.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    MLX_PER_MODEL_INFLIGHT_CAP = 1
+elif _inflight_cap_env is None:
+    MLX_PER_MODEL_INFLIGHT_CAP = _legacy_admission_cap
+else:
+    MLX_PER_MODEL_INFLIGHT_CAP = int(_inflight_cap_env)
 MLX_QUEUE_MAX_PER_MODEL = int(os.environ.get("MLX_QUEUE_MAX_PER_MODEL", "32"))
 MLX_QUEUE_MAX_TOTAL = int(os.environ.get("MLX_QUEUE_MAX_TOTAL", "128"))
 MLX_QUEUE_WAIT_TIMEOUT_SEC = float(os.environ.get("MLX_QUEUE_WAIT_TIMEOUT_SEC", "20"))
@@ -856,25 +936,92 @@ def _mlx_load_model(path: str):
         return mlx_lm.load(path)
 
 
+# Whether to force a ``gc.collect()`` after every Metal cache clear.
+# Off by default — gc.collect() is noticeable wall time on macOS, and
+# the Metal allocator usually reclaims promptly once Python refs drop.
+# Operators on memory-tight Macs can opt in to trade latency for tighter
+# RSS reclamation immediately after eviction.
+MLX_FORCE_GC_ON_EVICT = os.environ.get("MLX_FORCE_GC_ON_EVICT", "0").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+
+def _try_clear_mlx_metal_cache() -> str | None:
+    """Best-effort Metal cache release after MLX eviction or unload.
+
+    The mlx_lm public API has churned across versions; feature-detect
+    the available teardown call and silently skip on unsupported
+    variants. Returns the name of the function actually called (for
+    logging) or ``None`` if nothing was available.
+
+    Eviction never fails on teardown errors — at worst we leak some
+    Metal allocator slack until the next allocator pressure point.
+    """
+    try:
+        import mlx.core as _mx  # type: ignore
+    except ImportError:
+        return None
+    try:
+        if hasattr(_mx, "metal") and hasattr(_mx.metal, "clear_cache"):
+            _mx.metal.clear_cache()
+            return "mx.metal.clear_cache"
+        if hasattr(_mx, "clear_cache"):
+            _mx.clear_cache()
+            return "mx.clear_cache"
+    except Exception as e:  # noqa: BLE001
+        log.debug("Metal cache teardown failed (non-fatal): %s", e)
+    return None
+
+
+def _post_evict_cleanup(reason: str, alias: str) -> None:
+    """Run after a model is evicted from the MLXManager registry —
+    either by LRU eviction during a load or by an explicit (possibly
+    deferred) unload. Triggers the best-effort Metal cache release
+    and, if MLX_FORCE_GC_ON_EVICT is set, a Python-level gc.collect().
+
+    Every step here is wrapped in try/except: post-evict cleanup is
+    *opportunistic*. A failure to clear the Metal cache must never
+    prevent the eviction from completing — at worst we leak some
+    allocator slack until the next pressure point.
+    """
+    try:
+        cleared = _try_clear_mlx_metal_cache()
+        if cleared:
+            log.debug("Post-evict cleanup '%s' (%s): cleared via %s", alias, reason, cleared)
+    except Exception as e:  # noqa: BLE001
+        log.debug(
+            "Post-evict metal teardown for '%s' (%s) raised (non-fatal): %s",
+            alias, reason, e,
+        )
+    if MLX_FORCE_GC_ON_EVICT:
+        try:
+            import gc as _gc
+            collected = _gc.collect()
+            log.debug(
+                "Post-evict gc.collect '%s' (%s): freed %d objects",
+                alias, reason, collected,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "Post-evict gc.collect for '%s' (%s) raised (non-fatal): %s",
+                alias, reason, e,
+            )
+
+
 _MLX_OOM_HINT = (
     "Detected probable memory pressure. Try the stable launcher "
     "(./start_middle_layerMLX_5001_stable.sh) or lower MAX_CONCURRENT_MODELS, "
-    "MAX_WORKERS, and max_tokens."
+    "MLX_PER_MODEL_INFLIGHT_CAP, and max_tokens."
 )
 
 
-def _is_probable_oom_error(exc: BaseException | str) -> bool:
-    txt = str(exc).lower()
-    markers = (
-        "out of memory",
-        "oom",
-        "mps backend out of memory",
-        "resource exhausted",
-        "killed",
-        "std::bad_alloc",
-        "allocation failed",
-    )
-    return any(m in txt for m in markers)
+# Re-export the shared OOM classifier from middle_layer.swarm. The
+# previous in-file implementation used a naive substring match that
+# false-positived on "zoom", "room", etc., and was not visible to the
+# swarm classifier — so MLX OOMs classified as error_kind="unknown"
+# in structured swarm error_details. PR 7 of the MLX audit hardening
+# pass consolidates both gateways onto the shared word-boundary regex.
+from middle_layer.swarm import is_probable_oom_error as _is_probable_oom_error  # noqa: E402
 
 
 def _mlx_error_with_guidance(exc: BaseException | str, prefix: str) -> str:
@@ -918,14 +1065,32 @@ if CORS_ORIGINS:
 class MLXManager:
     """Discovers, loads, and serializes access to MLX models on disk.
 
-    `loaded_models[alias]` -> (model, tokenizer, gen_lock, last_used).
+    `loaded_models[alias]` -> (model, tokenizer, gen_lock). LRU recency
+    is tracked entirely via ``OrderedDict.move_to_end`` on every cache
+    hit; the previous 4-tuple stored a ``last_used`` timestamp that
+    was written on every hit and never read anywhere — dead weight
+    pruned in the PR 10 cleanup pass of the audit hardening plan.
 
     Concurrency rules:
-      * `_registry_lock` protects the OrderedDict (eviction, insert, lookup).
+      * `_registry_lock` protects the OrderedDict (eviction, insert, lookup),
+        the per-alias inflight refcount, and the deferred-unload set.
       * Each model has its own `gen_lock`; callers MUST hold it while running
         `mlx_lm.generate` / `mlx_lm.stream_generate` on that model.
       * Per-alias `_loading_locks[alias]` prevents two threads from loading
-        the same model concurrently.
+        the same model concurrently. Pruned on unload + when inflight==0.
+
+    In-flight pinning (added in the swarm-intelligence-effectiveness +
+    audit hardening pass):
+      * Every inference site MUST go through ``acquire_inference_handle``
+        (the context manager) instead of calling ``load_model`` directly.
+        That increments an inflight refcount for the alias.
+      * ``_ensure_capacity_locked`` skips pinned aliases when picking an
+        eviction victim, so an LRU eviction never yanks a model out from
+        under a running generation. (If *every* resident alias is pinned,
+        a new load proceeds anyway and logs a warning — exceeding the
+        configured cap is preferred to deadlocking the caller.)
+      * ``unload_model`` is pin-aware: if the alias is in-flight, the
+        unload is *deferred* and fires when the last holder releases.
     """
 
     def __init__(self, root_path):
@@ -935,6 +1100,23 @@ class MLXManager:
         self._registry_lock = threading.Lock()
         self._loading_locks: dict[str, threading.Lock] = {}
         self._last_load_errors: dict[str, str] = {}
+        # Timestamp (epoch seconds) of each entry in ``_last_load_errors``
+        # so /healthz can show operators when a failure happened
+        # without log-grep. Cleared in lockstep with ``_last_load_errors``.
+        self._last_load_error_ts: dict[str, int] = {}
+        # Per-alias inflight refcount. Incremented by
+        # ``acquire_inference_handle`` on entry, decremented on exit.
+        # Protected by ``_registry_lock``.
+        self._inflight: dict[str, int] = {}
+        # Aliases whose ``unload_model`` was called while pinned. The
+        # actual dict eviction happens when the last holder releases.
+        self._unload_pending: set[str] = set()
+        # Aliases that were evicted under a locked block and need a
+        # post-evict Metal cleanup pass once the lock is released.
+        # Drained by ``_drain_post_evict_cleanup`` which the caller
+        # invokes *after* releasing ``_registry_lock`` so Metal
+        # teardown doesn't block other manager operations.
+        self._pending_post_evict_cleanup: list[str] = []
         self.context_windows: dict = {}
         self._scan()
         self._load_context_windows()
@@ -945,24 +1127,112 @@ class MLXManager:
             log.warning("MLX root does not exist: %s", self.root_path)
             return
         log.info("Scanning MLX models in: %s", self.root_path)
-        for entry in os.scandir(self.root_path):
+        try:
+            entries = list(os.scandir(self.root_path))
+        except (PermissionError, OSError) as e:
+            # Audit finding: previously the root-level scandir failure
+            # would raise out of __init__ with a confusing stack trace.
+            # Now we log the path + exception and continue with an
+            # empty registry — operators see the cause without grep.
+            log.warning(
+                "MLX root scan failed for %s (%s); proceeding with empty registry",
+                self.root_path,
+                e,
+            )
+            return
+        for entry in entries:
             if not entry.is_dir():
                 continue
             cfg = os.path.join(entry.path, "config.json")
             if not os.path.exists(cfg):
                 # Could be a publisher dir with model subdirs (LM Studio layout).
                 try:
-                    for sub in os.scandir(entry.path):
-                        if sub.is_dir() and os.path.exists(os.path.join(sub.path, "config.json")):
-                            alias = f"{entry.name}/{sub.name}"
-                            self.registry[alias] = sub.path
-                            log.info("  Found: %s", alias)
-                except Exception:
-                    pass
+                    sub_entries = list(os.scandir(entry.path))
+                except (PermissionError, OSError) as e:
+                    # Audit finding: bare ``except Exception: pass``
+                    # used to swallow these silently — operators saw
+                    # "0 models found" with no clue why. Now logged
+                    # at WARNING with the publisher path + exception
+                    # type so the cause is obvious.
+                    log.warning(
+                        "Cannot scan publisher dir %s (%s); skipping",
+                        entry.path,
+                        e,
+                    )
+                    continue
+                for sub in sub_entries:
+                    if sub.is_dir() and os.path.exists(os.path.join(sub.path, "config.json")):
+                        alias = f"{entry.name}/{sub.name}"
+                        self.registry[alias] = sub.path
+                        log.info("  Found: %s", alias)
                 continue
             alias = entry.name
             self.registry[alias] = entry.path
             log.info("  Found: %s", alias)
+
+    def rescan(self) -> dict:
+        """Re-walk ``MLX_MODEL_ROOT`` to pick up models added or
+        removed on disk since startup. Loaded models stay loaded
+        (eviction is operator-controlled via DELETE /v1/models or
+        LRU pressure); only the registry is refreshed.
+
+        Returns a dict with ``added``, ``removed``, ``unchanged`` lists
+        of alias names so the dashboard / CLI caller can show a diff.
+
+        Audit finding: the original implementation only scanned once
+        at ``__init__``, so newly-downloaded models required a process
+        restart. ``rescan`` closes that gap without breaking the
+        startup-only invariant: existing aliases never change paths,
+        and loaded handles continue to work even if their alias
+        disappears from the registry.
+        """
+        old = set(self.registry.keys())
+        # Build a fresh registry into a temp dict, then atomically swap.
+        new_registry: dict[str, str] = {}
+        if not os.path.exists(self.root_path):
+            log.warning("MLX root does not exist on rescan: %s", self.root_path)
+        else:
+            try:
+                entries = list(os.scandir(self.root_path))
+            except (PermissionError, OSError) as e:
+                log.warning(
+                    "MLX root rescan failed for %s (%s); keeping current registry",
+                    self.root_path,
+                    e,
+                )
+                return {"added": [], "removed": [], "unchanged": sorted(old)}
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
+                cfg = os.path.join(entry.path, "config.json")
+                if not os.path.exists(cfg):
+                    try:
+                        sub_entries = list(os.scandir(entry.path))
+                    except (PermissionError, OSError) as e:
+                        log.warning(
+                            "Rescan cannot read publisher dir %s (%s); skipping",
+                            entry.path,
+                            e,
+                        )
+                        continue
+                    for sub in sub_entries:
+                        if sub.is_dir() and os.path.exists(os.path.join(sub.path, "config.json")):
+                            new_registry[f"{entry.name}/{sub.name}"] = sub.path
+                else:
+                    new_registry[entry.name] = entry.path
+
+        with self._registry_lock:
+            self.registry = new_registry
+
+        new = set(new_registry.keys())
+        added = sorted(new - old)
+        removed = sorted(old - new)
+        unchanged = sorted(new & old)
+        if added:
+            log.info("Rescan added: %s", added)
+        if removed:
+            log.info("Rescan removed from registry: %s", removed)
+        return {"added": added, "removed": removed, "unchanged": unchanged}
 
     def _load_context_windows(self):
         cfg = os.path.join(os.path.dirname(__file__), "mlx_context_windows.json")
@@ -970,7 +1240,15 @@ class MLXManager:
             try:
                 with open(cfg, "r") as f:
                     self.context_windows = json.load(f)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                # Audit finding: previously swallowed silently → operators
+                # never knew their context-window hints weren't being
+                # applied. Log at WARNING with the path + exception.
+                log.warning(
+                    "Cannot load %s (%s); per-model context windows disabled",
+                    cfg,
+                    e,
+                )
                 self.context_windows = {}
 
     def get_available_aliases(self):
@@ -984,30 +1262,195 @@ class MLXManager:
         with self._registry_lock:
             return self._last_load_errors.get(alias)
 
+    def get_recent_load_errors(self) -> dict[str, dict]:
+        """Return a snapshot of every alias with a sticky load error
+        (set by the most recent failed ``load_model`` and cleared on
+        successful load or explicit unload). Used by ``/healthz`` and
+        the dashboard snapshot so operators can see ``alias X failed
+        to load 3 hours ago`` without log grep.
+
+        Returns ``{alias: {"error": str, "ts": int}}`` keyed by alias,
+        with epoch-second timestamps. Empty dict when nothing has failed.
+        """
+        with self._registry_lock:
+            return {
+                alias: {
+                    "error": self._last_load_errors[alias],
+                    "ts": self._last_load_error_ts.get(alias, 0),
+                }
+                for alias in self._last_load_errors
+            }
+
     def get_memory_stats(self):
         with self._registry_lock:
             return {
                 "loaded": list(self.loaded_models.keys()),
                 "count": len(self.loaded_models),
                 "max": MAX_CONCURRENT_MODELS,
+                "recent_load_errors_count": len(self._last_load_errors),
             }
 
     # ---------- loading (thread-safe) ------------------------------------
-    def _ensure_capacity_locked(self):
-        """Caller MUST hold _registry_lock."""
-        while len(self.loaded_models) >= MAX_CONCURRENT_MODELS:
-            oldest_alias, _ = self.loaded_models.popitem(last=False)
-            log.info("LRU eviction: '%s'", oldest_alias)
+    def _evict_alias_locked(self, alias: str) -> None:
+        """Caller MUST hold _registry_lock. Drop ``alias`` from the
+        loaded dict and prune its per-alias load lock. Does NOT check
+        inflight pinning — callers must do that.
+        """
+        self.loaded_models.pop(alias, None)
+        self._loading_locks.pop(alias, None)
+        self._unload_pending.discard(alias)
 
-    def unload_model(self, alias) -> bool:
-        """Explicitly unload a model from memory. Returns True if it was loaded."""
+    def _drain_post_evict_cleanup(self, reason: str = "eviction") -> None:
+        """Run ``_post_evict_cleanup`` for every alias queued under
+        the registry lock. MUST be called outside the lock so Metal
+        teardown doesn't block other manager operations.
+        """
+        with self._registry_lock:
+            pending = list(self._pending_post_evict_cleanup)
+            self._pending_post_evict_cleanup.clear()
+        for alias in pending:
+            _post_evict_cleanup(reason, alias)
+
+    def _ensure_capacity_locked(self):
+        """Caller MUST hold _registry_lock.
+
+        Pick the oldest *unpinned* resident alias to evict until we're
+        under the cap. If every resident alias is currently in-flight,
+        let the new load proceed and exceed the cap rather than
+        deadlocking — log loudly so the operator sees they need to
+        raise ``MAX_CONCURRENT_MODELS`` or reduce request concurrency.
+
+        Each successful eviction also triggers ``_post_evict_cleanup``
+        which best-effort-clears the Metal allocator cache (and
+        optionally runs ``gc.collect()`` when
+        ``MLX_FORCE_GC_ON_EVICT=1``). The cleanup runs *after*
+        releasing the registry lock so we don't block other callers
+        on Metal teardown.
+        """
+        evicted_aliases: list[str] = []
+        while len(self.loaded_models) >= MAX_CONCURRENT_MODELS:
+            victim = None
+            for alias in self.loaded_models:  # OrderedDict iteration is oldest-first
+                if self._inflight.get(alias, 0) == 0:
+                    victim = alias
+                    break
+            if victim is None:
+                pinned = {
+                    a: self._inflight.get(a, 0)
+                    for a in self.loaded_models
+                }
+                log.warning(
+                    "MAX_CONCURRENT_MODELS=%d exceeded: all %d resident "
+                    "aliases are in-flight (%s). New load proceeding; "
+                    "raise MAX_CONCURRENT_MODELS or reduce request "
+                    "concurrency to stay within the cap.",
+                    MAX_CONCURRENT_MODELS,
+                    len(self.loaded_models),
+                    pinned,
+                )
+                return
+            self._evict_alias_locked(victim)
+            evicted_aliases.append(victim)
+            log.info("LRU eviction: '%s'", victim)
+        # Defer the cleanup call to a sibling helper (called by load_model
+        # after dropping the registry lock) so we don't pay Metal teardown
+        # cost while holding the lock. We can't safely call it inline here
+        # because callers nest this inside a locked block.
+        if evicted_aliases:
+            self._pending_post_evict_cleanup.extend(evicted_aliases)
+
+    def unload_model(self, alias) -> dict:
+        """Explicitly unload a model from memory.
+
+        Returns ``{"unloaded": bool, "deferred": bool}``. If the alias
+        is currently in-flight, the unload is deferred and fires when
+        the last holder releases via ``acquire_inference_handle``'s
+        context exit. Operators see ``deferred=True`` immediately so
+        the HTTP DELETE caller knows the action was accepted.
+        """
         with self._registry_lock:
             self._last_load_errors.pop(alias, None)
-            if alias in self.loaded_models:
-                del self.loaded_models[alias]
-                log.info("Unloaded model '%s' (resident: %s)", alias, list(self.loaded_models.keys()))
-                return True
-        return False
+            self._last_load_error_ts.pop(alias, None)
+            if alias not in self.loaded_models:
+                return {"unloaded": False, "deferred": False}
+            if self._inflight.get(alias, 0) > 0:
+                self._unload_pending.add(alias)
+                log.info(
+                    "Unload deferred for '%s' (inflight=%d); will fire on "
+                    "last release",
+                    alias,
+                    self._inflight[alias],
+                )
+                return {"unloaded": False, "deferred": True}
+            self._evict_alias_locked(alias)
+            self._pending_post_evict_cleanup.append(alias)
+            log.info(
+                "Unloaded model '%s' (resident: %s)",
+                alias,
+                list(self.loaded_models.keys()),
+            )
+        # Drain Metal cleanup outside the registry lock so we don't
+        # block other manager operations on Metal teardown.
+        self._drain_post_evict_cleanup(reason="unload")
+        return {"unloaded": True, "deferred": False}
+
+    def pin_alias(self, alias: str) -> None:
+        """Increment the inflight refcount for ``alias``. Caller MUST
+        pair this with exactly one ``release_pin(alias)`` in a
+        ``finally`` block. Use ``acquire_inference_handle`` when the
+        load + pin + generation all happen in the same synchronous
+        scope; use this lower-level method when the pin must outlive
+        the function call (e.g. a Flask streaming generator)."""
+        with self._registry_lock:
+            self._inflight[alias] = self._inflight.get(alias, 0) + 1
+
+    def release_pin(self, alias: str) -> None:
+        """Decrement the inflight refcount for ``alias``. If the
+        refcount hits zero and an unload was deferred while pinned,
+        the actual eviction fires here."""
+        deferred_drained = False
+        with self._registry_lock:
+            remaining = self._inflight.get(alias, 1) - 1
+            if remaining <= 0:
+                self._inflight.pop(alias, None)
+                if alias in self._unload_pending:
+                    self._evict_alias_locked(alias)
+                    self._pending_post_evict_cleanup.append(alias)
+                    deferred_drained = True
+                    log.info(
+                        "Deferred unload of '%s' fired (resident: %s)",
+                        alias,
+                        list(self.loaded_models.keys()),
+                    )
+            else:
+                self._inflight[alias] = remaining
+        if deferred_drained:
+            self._drain_post_evict_cleanup(reason="deferred-unload")
+
+    @contextlib.contextmanager
+    def acquire_inference_handle(self, alias):
+        """Reserve an alias for inference. Yields
+        ``(model, tokenizer, gen_lock)`` or ``None`` if the load
+        failed (caller checks the yielded value).
+
+        While the context is active the alias is *pinned*:
+        ``_ensure_capacity_locked`` will not evict it, and
+        ``unload_model`` defers the actual drop until the last holder
+        releases. This is the canonical entry point for every
+        synchronous inference call site; for Flask streaming paths
+        (where the generator outlives the function call), use
+        ``pin_alias`` / ``release_pin`` directly and tie the release
+        to the generator's ``finally`` block.
+        """
+        handle = self.load_model(alias)
+        if handle is None:
+            yield None
+            return
+        self.pin_alias(alias)
+        try:
+            yield handle
+        finally:
+            self.release_pin(alias)
 
     def load_model(self, alias):
         """Returns (model, tokenizer, gen_lock) or None.
@@ -1017,12 +1460,13 @@ class MLXManager:
         if not MLX_AVAILABLE:
             return None
 
-        # Fast-path cache check.
+        # Fast-path cache check. Entries are 3-tuples — LRU recency is
+        # tracked via OrderedDict ordering (move_to_end), so we no
+        # longer need a per-entry timestamp.
         with self._registry_lock:
             if alias in self.loaded_models:
-                model, tokenizer, gen_lock, _ = self.loaded_models[alias]
+                model, tokenizer, gen_lock = self.loaded_models[alias]
                 self.loaded_models.move_to_end(alias)
-                self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
                 return model, tokenizer, gen_lock
             path = self.registry.get(alias)
             if not path:
@@ -1033,9 +1477,8 @@ class MLXManager:
         with per_alias:
             with self._registry_lock:
                 if alias in self.loaded_models:
-                    model, tokenizer, gen_lock, _ = self.loaded_models[alias]
+                    model, tokenizer, gen_lock = self.loaded_models[alias]
                     self.loaded_models.move_to_end(alias)
-                    self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
                     return model, tokenizer, gen_lock
 
             log.info("Loading MLX model '%s' from %s", alias, path)
@@ -1045,14 +1488,19 @@ class MLXManager:
                 err = _mlx_error_with_guidance(e, f"Failed to load MLX model '{alias}'")
                 with self._registry_lock:
                     self._last_load_errors[alias] = err
+                    self._last_load_error_ts[alias] = int(time.time())
                 log.error("%s", err)
                 return None
 
             with self._registry_lock:
                 self._ensure_capacity_locked()
                 gen_lock = threading.Lock()
-                self.loaded_models[alias] = (model, tokenizer, gen_lock, time.time())
+                self.loaded_models[alias] = (model, tokenizer, gen_lock)
                 self._last_load_errors.pop(alias, None)
+                self._last_load_error_ts.pop(alias, None)
+            # Drain Metal cleanup for anything evicted during
+            # _ensure_capacity_locked, outside the lock.
+            self._drain_post_evict_cleanup(reason="lru-eviction")
             log.info("Loaded '%s' (resident: %s)", alias, self.get_loaded_aliases())
             return model, tokenizer, gen_lock
 
@@ -1109,9 +1557,23 @@ def init_mlx_grab_model() -> str | None:
         dest = os.path.join(cache_root, local_name)
         os.makedirs(dest, exist_ok=True)
         log.info("MLX_GRAB_MODEL: downloading %r -> %s", spec, dest)
-        snapshot_download(repo_id=spec, local_dir=dest, local_dir_use_symlinks=False)
+        # Audit finding: snapshot_download exceptions used to propagate
+        # as raw tracebacks. Now caught and surfaced as a clean error
+        # string with a hint to delete the partial download and retry.
+        try:
+            snapshot_download(repo_id=spec, local_dir=dest, local_dir_use_symlinks=False)
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"Hugging Face download failed for {spec!r}: {e}. "
+                f"Partial files may remain under {dest}; delete that "
+                "directory and retry, or check network/credentials."
+            )
         if not os.path.isfile(os.path.join(dest, "config.json")):
-            return f"Download finished but config.json missing under {dest}"
+            return (
+                f"Hugging Face download completed for {spec!r} but "
+                f"config.json is missing under {dest}. The repo may "
+                "not contain a self-contained MLX model layout."
+            )
         path = os.path.abspath(dest)
     else:
         return (
@@ -1344,30 +1806,22 @@ def _handle_grab_chat(data: dict, dash_rid: str | None = None, request_headers=N
                     model, tokenizer, formatted, max_tokens, temperature, top_p,
                     timeout_sec=GENERATION_TIMEOUT,
                 )
-            except TimeoutError as e:
-                elapsed = int((time.perf_counter() - t0) * 1000)
-                if _mlx_dash is not None:
-                    _mlx_dash.record_event(
-                        request_id=dash_rid,
-                        parent_request_id=None,
-                        agent_slot=None,
-                        route_kind="chat_grab",
-                        requested_model=req_str,
-                        resolved_model=str(label),
-                        backend="mlx",
-                        stream=False,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=max(1, elapsed),
-                        status="error",
-                        error_message=str(e),
-                        preview=_mlx_dash.build_preview(msgs),
-                    )
-                return Response(json.dumps({"error": str(e)}),
-                                status=504, mimetype="application/json")
             except Exception as e:
+                # NOTE: _mlx_generate_text_timed treats timeout_sec as a
+                # soft budget for logging only — mlx_lm generation is not
+                # safely cancellable mid-flight, so a TimeoutError handler
+                # here would be dead code. All real generation failures
+                # land in this Exception branch.
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                log.warning(
+                    "MLX (grab) generation failed: label=%s request_id=%s "
+                    "exc_type=%s elapsed_ms=%d msg=%s",
+                    label,
+                    dash_rid,
+                    type(e).__name__,
+                    elapsed,
+                    str(e)[:200],
+                )
                 if _mlx_dash is not None:
                     _mlx_dash.record_event(
                         request_id=dash_rid,
@@ -2066,83 +2520,104 @@ def _call_anthropic_chat(messages, model_override=None, **kwargs):
 # =============================================================================
 
 
-def _mlx_chat_completion(alias, messages, max_tokens=None, temperature=None, top_p=None, prompt=None):
-    """Returns (openai_shaped_response, error). Acquires per-model gen_lock."""
+def _mlx_chat_completion(
+    alias,
+    messages,
+    max_tokens=None,
+    temperature=None,
+    top_p=None,
+    prompt=None,
+    *,
+    queue_controls: dict | None = None,
+    request_id: str | None = None,
+):
+    """Returns (openai_shaped_response, error). Acquires per-model gen_lock.
+
+    ``queue_controls`` lets swarm callers thread per-request admission
+    priority / wait budgets through to the scheduler — the audit found
+    this was always ``None`` (top-level requests' priority was silently
+    dropped at the swarm fanout boundary). Pass-through is opt-in; the
+    HTTP chat handler still passes its parsed controls directly.
+    ``request_id`` defaults to a fresh swarm-flavored UUID when not
+    provided.
+    """
     if not MLX_AVAILABLE:
         return None, "MLX not available (mlx_lm not installed)"
 
     ok_ad, ad_meta = _admission_acquire(
         alias,
-        request_id=f"swarm_{uuid.uuid4().hex}",
+        request_id=request_id or f"swarm_{uuid.uuid4().hex}",
         stream=False,
-        queue_controls=None,
+        queue_controls=queue_controls,
     )
     if not ok_ad:
         payload, _headers = _admission_retry_hint(alias, ad_meta)
         return None, payload.get("error") or "Admission rejected"
     try:
-        handle = mlx_manager.load_model(alias)
-        if handle is None:
-            load_err = mlx_manager.get_last_load_error(alias)
-            if load_err:
-                return None, load_err
-            return None, f"Could not load MLX model '{alias}'"
-        model, tokenizer, gen_lock = handle
+        with mlx_manager.acquire_inference_handle(alias) as handle:
+            if handle is None:
+                load_err = mlx_manager.get_last_load_error(alias)
+                if load_err:
+                    return None, load_err
+                return None, f"Could not load MLX model '{alias}'"
+            model, tokenizer, gen_lock = handle
 
-        profile = get_model_profile(alias)
-        temperature, top_p = _apply_sampler_defaults(temperature, top_p, profile)
-        msgs, formatted, prompt_tok, trim_err = _trim_messages_for_context(
-            tokenizer,
-            messages if isinstance(messages, list) else [],
-            prompt or "",
-            int(profile.get("context_window") or 8192),
-            _clamp_max_tokens(max_tokens, profile),
-            MLX_CONTEXT_TRIM_BUFFER,
-        )
-        if trim_err:
-            return None, trim_err
-        if not formatted:
-            return None, "empty prompt"
-
-        mt = _clamp_max_tokens(max_tokens, profile)
-        cw = int(profile.get("context_window") or 8192)
-        mt, _clamped, impossible = _budget_max_tokens(prompt_tok, mt, cw, MLX_CONTEXT_TRIM_BUFFER)
-        if impossible:
-            return None, (
-                f"No completion budget left (prompt_tokens≈{prompt_tok}, context_window={cw}). "
-                "Shorten the prompt or choose a larger-context model."
+            profile = get_model_profile(alias)
+            temperature, top_p = _apply_sampler_defaults(temperature, top_p, profile)
+            msgs, formatted, prompt_tok, trim_err = _trim_messages_for_context(
+                tokenizer,
+                messages if isinstance(messages, list) else [],
+                prompt or "",
+                int(profile.get("context_window") or 8192),
+                _clamp_max_tokens(max_tokens, profile),
+                MLX_CONTEXT_TRIM_BUFFER,
             )
+            if trim_err:
+                return None, trim_err
+            if not formatted:
+                return None, "empty prompt"
 
-        t0 = time.time()
-        with gen_lock:
-            try:
-                text, prompt_tok, comp_tok = _mlx_generate_text_timed(
-                    model, tokenizer, formatted, mt, temperature, top_p,
-                    timeout_sec=GENERATION_TIMEOUT,
+            mt = _clamp_max_tokens(max_tokens, profile)
+            cw = int(profile.get("context_window") or 8192)
+            mt, _clamped, impossible = _budget_max_tokens(prompt_tok, mt, cw, MLX_CONTEXT_TRIM_BUFFER)
+            if impossible:
+                return None, (
+                    f"No completion budget left (prompt_tokens≈{prompt_tok}, context_window={cw}). "
+                    "Shorten the prompt or choose a larger-context model."
                 )
-            except TimeoutError as e:
-                return None, str(e)
-            except Exception as e:
-                return None, _mlx_error_with_guidance(e, "MLX generation error")
-        elapsed = int((time.time() - t0) * 1000)
 
-        return {
-            "id": f"chatcmpl_{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": alias,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text or ""},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tok,
-                "completion_tokens": comp_tok,
-                "total_tokens": prompt_tok + comp_tok,
-            },
-            "_meta": {"latency_ms": elapsed, "backend": "mlx"},
-        }, None
+            t0 = time.time()
+            with gen_lock:
+                try:
+                    text, prompt_tok, comp_tok = _mlx_generate_text_timed(
+                        model, tokenizer, formatted, mt, temperature, top_p,
+                        timeout_sec=GENERATION_TIMEOUT,
+                    )
+                except Exception as e:
+                    # _mlx_generate_text_timed treats timeout_sec as a
+                    # soft budget for logging; it never raises
+                    # TimeoutError (mlx_lm generation is not safely
+                    # cancellable mid-flight). All failures land here.
+                    return None, _mlx_error_with_guidance(e, "MLX generation error")
+            elapsed = int((time.time() - t0) * 1000)
+
+            return {
+                "id": f"chatcmpl_{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": alias,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text or ""},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tok,
+                    "completion_tokens": comp_tok,
+                    "total_tokens": prompt_tok + comp_tok,
+                },
+                "_meta": {"latency_ms": elapsed, "backend": "mlx"},
+            }, None
     finally:
         _admission_release(alias)
 
@@ -2172,8 +2647,15 @@ def _normalize_agent_spec(spec):
     return {"model": str(spec)}
 
 
-def _run_one_agent(spec, default_messages, default_kwargs, available):
-    """Returns (label, openai_response, error, latency_ms)."""
+def _run_one_agent(spec, default_messages, default_kwargs, available, *, queue_controls=None):
+    """Returns (label, openai_response, error, latency_ms).
+
+    ``queue_controls`` propagates per-request admission priority / wait
+    budgets from the parent (chat or HTTP /swarm/* handler) into the
+    per-agent admission acquire. Audit finding: this used to always
+    be None at the swarm fanout boundary, so the operator-supplied
+    priority on a swarm request was silently dropped for every agent.
+    """
     spec = _normalize_agent_spec(spec)
     requested = spec.get("model")
     requested_str = (requested or "").strip()
@@ -2213,6 +2695,7 @@ def _run_one_agent(spec, default_messages, default_kwargs, available):
         max_tokens=kwargs.get("max_tokens"),
         temperature=kwargs.get("temperature"),
         top_p=kwargs.get("top_p"),
+        queue_controls=queue_controls,
     )
     return alias, resp, err, int((time.time() - t0) * 1000)
 
@@ -2226,7 +2709,160 @@ def _swarm_fanout_budget_seconds(spec_count: int) -> float:
     return float(min(3600.0, per * n))
 
 
-def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id=None, route_kind="swarm_fanout"):
+def _parse_judge_verdict(verdict, labels):
+    """Extract the chosen candidate index from a judge model's free-form reply.
+
+    The prompt asks the judge to "reply with ONLY the letter on its own line",
+    but real models routinely answer with ``**A**``, ``Answer: A``, ``[A]``,
+    ``I pick A because…``, or just embed the letter in prose. A brittle
+    ``^A\\b`` regex falls through to the "longest" fallback on any of those,
+    which silently degrades vote into a length contest.
+
+    Patterns are tried strict-first to keep ambiguous answers from being
+    over-eagerly matched. Returns the index into ``labels`` of the selected
+    candidate, or ``None`` if no label can be identified.
+    """
+    if not isinstance(verdict, str) or not verdict.strip():
+        return None
+    if not labels:
+        return None
+    text = verdict.strip()
+    label_class = "[" + "".join(re.escape(lab) for lab in labels) + "]"
+
+    patterns = (
+        # Bare label on its own line, optionally bold / bracketed / parenthesized.
+        rf"(?m)^\s*\**\(?\[?({label_class})\]?\)?\**\s*[.\):,!?\-]?\s*$",
+        # Label at start of a line (with possible trailing prose).
+        rf"(?m)^\s*\**({label_class})\**\b",
+        # Explicit declarations: "answer is A", "pick A", "winner: A", etc.
+        rf"(?i)(?:answer|pick|choose|winner|verdict|best|select|chosen|choice)"
+        rf"(?:\s+is)?[:\s]+\**\(?\[?({label_class})\]?\)?\**\b",
+        # Bold / bracketed / parenthesized letter anywhere.
+        rf"\*\*({label_class})\*\*",
+        rf"\[({label_class})\]",
+        rf"\(({label_class})\)",
+        # Last resort: first standalone label letter occurrence anywhere.
+        rf"\b({label_class})\b",
+    )
+
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            letter = m.group(1).upper()
+            try:
+                return labels.index(letter)
+            except ValueError:
+                continue
+    return None
+
+
+def _substitute_pipeline_template(template, ctx):
+    """Substitute ``{{name}}`` placeholders without triggering ``str.format``.
+
+    The previous implementation used ``re.sub`` to map ``{{name}}`` -> ``{name}``
+    then ran ``template.format(**ctx)``, which exploded on any earlier stage
+    output that contained literal ``{`` or ``}`` (e.g. Python f-strings, dict
+    literals, JSON). The ``except (KeyError, IndexError)`` branch silently
+    returned the original template with placeholders intact, so downstream
+    stages received literal ``{{previous}}`` instead of the prior text.
+
+    This version does direct replacement on ``{{name}}`` only, so values
+    containing braces are inert. Unknown keys are left as their literal
+    ``{{name}}`` placeholder (matches the prior behavior's intent).
+    """
+    if not isinstance(template, str):
+        return template
+    if not template or "{{" not in template:
+        return template
+    result = template
+    if isinstance(ctx, dict):
+        for key, value in ctx.items():
+            if not isinstance(key, str):
+                continue
+            needle = "{{" + key + "}}"
+            if needle in result:
+                result = result.replace(needle, "" if value is None else str(value))
+    return result
+
+
+# Sentinel tokens that expand a swarm ``models`` list to whatever the MLX
+# manager has currently in memory. Recognized in both ``swarm.models``
+# (per-request) and the ``SWARM_CHAT_DEFAULT_MODELS`` env var. ``available``
+# / ``configured`` map to the broader registry (lazy-loadable aliases) so
+# users can opt into the wider fanout when nothing is preloaded.
+_SWARM_AUTO_LOADED_TOKENS = frozenset({"auto", "loaded", "*", "all", "all-loaded"})
+_SWARM_AUTO_AVAILABLE_TOKENS = frozenset({"available", "configured", "all-available"})
+_SWARM_AUTO_TOKENS = _SWARM_AUTO_LOADED_TOKENS | _SWARM_AUTO_AVAILABLE_TOKENS
+
+
+def _is_auto_swarm_token(value) -> bool:
+    return isinstance(value, str) and value.strip().lower() in _SWARM_AUTO_TOKENS
+
+
+def _expand_swarm_models(spec):
+    """Expand sentinel tokens in a swarm models list to MLX aliases.
+
+    ``auto`` / ``loaded`` / ``*`` / ``all`` / ``all-loaded`` -> currently
+    loaded MLX aliases (``mlx_manager.get_loaded_aliases()``). If nothing is
+    loaded yet, falls back to every configured alias so the swarm still has
+    something to fan out to (MLX lazy-loads on demand).
+
+    ``available`` / ``configured`` / ``all-available`` -> every configured
+    alias in the registry (``mlx_manager.get_available_aliases()``).
+
+    Non-sentinel entries (exact aliases, ``role:...``, wildcards,
+    ``anthropic[:model]``, etc.) pass through unchanged. Duplicate string
+    entries are dropped to keep the fanout small.
+
+    Returns ``(expanded_list, error_or_None)``. The caller should treat an
+    empty result as a hard error.
+    """
+    if isinstance(spec, str):
+        items = [spec]
+    elif isinstance(spec, list):
+        items = list(spec)
+    else:
+        return None, "swarm.models must be a list or sentinel string"
+
+    loaded_cache = None
+    available_cache = None
+
+    out = []
+    seen = set()
+    for entry in items:
+        if isinstance(entry, str) and entry.strip().lower() in _SWARM_AUTO_LOADED_TOKENS:
+            if loaded_cache is None:
+                loaded_cache = mlx_manager.get_loaded_aliases() or []
+                if not loaded_cache:
+                    # Lazy-load fallback: registry knows what *can* run.
+                    loaded_cache = mlx_manager.get_available_aliases() or []
+            for alias in loaded_cache:
+                if not isinstance(alias, str) or alias in seen:
+                    continue
+                seen.add(alias)
+                out.append(alias)
+            continue
+        if isinstance(entry, str) and entry.strip().lower() in _SWARM_AUTO_AVAILABLE_TOKENS:
+            if available_cache is None:
+                available_cache = mlx_manager.get_available_aliases() or []
+            for alias in available_cache:
+                if not isinstance(alias, str) or alias in seen:
+                    continue
+                seen.add(alias)
+                out.append(alias)
+            continue
+        if isinstance(entry, str):
+            key = entry.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        else:
+            out.append(entry)
+    return out, None
+
+
+def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id=None, route_kind="swarm_fanout", *, queue_controls=None):
     if not specs:
         return None, "swarm requires at least one model"
 
@@ -2252,13 +2888,34 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
         except Exception as exc:  # noqa: BLE001
             label, resp, latency = "?", None, 0
             err = str(exc)
+        text = _extract_text(resp) if resp else ""
+        api_ok = err is None and resp is not None
+        error_kind = None
+        http_status = None
+        error_detail = None
+        if not api_ok and err:
+            http_status = _extract_upstream_status(err)
+            error_kind = _classify_swarm_error(err, http_status=http_status)
+            error_detail = _strip_upstream_prefix(err)
+        elif api_ok and not text:
+            error_kind = "empty_response"
+            error_detail = (
+                "MLX returned a response with empty assistant content "
+                "(check reasoning_content / increase max_tokens)"
+            )
+            err = "empty assistant content"
+        ok = api_ok and bool(text)
         results[slot] = {
+            "agent_id": _spec_to_agent_id(specs[slot]),
             "model": label,
-            "ok": err is None and resp is not None,
+            "ok": ok,
             "error": err,
+            "error_kind": error_kind,
+            "http_status": http_status,
+            "error_detail": error_detail,
             "latency_ms": latency,
             "response": resp,
-            "text": _extract_text(resp) if resp else "",
+            "text": text,
         }
         if _mlx_dash is not None and parent_request_id:
             spec = specs[slot]
@@ -2288,7 +2945,7 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {
-            ex.submit(_run_one_agent, spec, messages, common_kwargs, available): i
+            ex.submit(_run_one_agent, spec, messages, common_kwargs, available, queue_controls=queue_controls): i
             for i, spec in enumerate(specs)
         }
         pending = set(futures.keys())
@@ -2303,13 +2960,18 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
         for fut in pending:
             i = futures[fut]
             fut.cancel()
+            timeout_err = (
+                "Timed out waiting for agent (fanout deadline; "
+                "set SWARM_FANOUT_TIMEOUT or SWARM_PER_CALL_TIMEOUT)."
+            )
             results[i] = {
+                "agent_id": _spec_to_agent_id(specs[i]),
                 "model": "?",
                 "ok": False,
-                "error": (
-                    "Timed out waiting for agent (fanout deadline; "
-                    "set SWARM_FANOUT_TIMEOUT or SWARM_PER_CALL_TIMEOUT)."
-                ),
+                "error": timeout_err,
+                "error_kind": "timeout",
+                "http_status": None,
+                "error_detail": timeout_err,
                 "latency_ms": 0,
                 "response": None,
                 "text": "",
@@ -2343,34 +3005,65 @@ def _fanout(specs, messages, common_kwargs, max_parallel=None, parent_request_id
 
 
 def _is_swarm_chat_model(requested_model) -> bool:
-    if not isinstance(requested_model, str):
-        return False
-    name = requested_model.strip().lower()
-    return name in {
-        "swarmcouncil",
-        "swarmvote",
-        "swarm/vote",
-        "swarm/fanout",
-        "swarm/pipeline",
-    }
+    """Back-compat predicate. Now delegates to the shared intent map so MLX
+    and the LM Studio gateway recognize the exact same alias set, including
+    ``swarmIntelligence`` (deprecated) which used to fall through here.
+    """
+    intent, _ = _swarm_chat_intent(requested_model)
+    return intent is not None
 
 
-def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_id: str | None = None):
-    """Run swarm fanout/vote semantics and return OpenAI-shaped chat completion."""
+def _run_swarm_chat_completion(
+    requested_model: str,
+    data: dict,
+    parent_request_id: str | None = None,
+    intent: str = "council",
+):
+    """Run swarm fanout/vote semantics and return ``(body, err, err_details)``.
+
+    See ``docs/capabilities.md`` for the contract. Intent semantics match
+    the LM Studio gateway:
+
+      ``council``   → ``SWARM_CHAT_DEFAULT_STRATEGY`` (best-of-n with judge).
+      ``fanout``    → ``"fanout"`` strategy by default (no judge ceremony).
+      ``pipeline``  → 400 redirecting the caller to ``POST /swarm/pipeline``.
+    """
+    if intent == "pipeline":
+        return None, (
+            "swarm/pipeline cannot run on /v1/chat/completions because the "
+            "OpenAI chat shape cannot carry 'stages[]'. Send your request to "
+            "POST /swarm/pipeline (with {stages: [{model, prompt_prefix}, ...], "
+            "input}) instead."
+        ), None
+
     messages = data.get("messages") or []
     if not isinstance(messages, list) or not messages:
-        return None, "messages (list) is required for swarm chat"
+        return None, "messages (list) is required for swarm chat", None
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
     common = {k: v for k, v in common.items() if v is not None}
 
     swarm_cfg = data.get("swarm") if isinstance(data.get("swarm"), dict) else {}
     models = swarm_cfg.get("models") or SWARM_CHAT_DEFAULT_MODELS
-    strategy = (swarm_cfg.get("strategy") or SWARM_CHAT_DEFAULT_STRATEGY).lower()
+    if swarm_cfg.get("strategy"):
+        strategy = swarm_cfg["strategy"].lower()
+    elif intent == "fanout":
+        strategy = "fanout"
+    else:
+        strategy = SWARM_CHAT_DEFAULT_STRATEGY.lower()
     max_parallel = swarm_cfg.get("max_parallel")
 
-    if not isinstance(models, list) or not models:
-        return None, "swarm.models must be a non-empty list"
+    if not isinstance(models, (list, str)) or not models:
+        return None, "swarm.models must be a non-empty list (or 'auto')", None
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return None, exp_err, None
+    if not models:
+        return None, (
+            "swarm.models expanded to an empty set: no MLX models loaded or "
+            "configured. Pass an explicit list or load/register at least one alias."
+        ), None
 
     candidates, err = _fanout(
         models,
@@ -2381,12 +3074,16 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
         route_kind="chat_swarm_vote",
     )
     if err:
-        return None, err
+        return None, err, None
 
     successes = [c for c in candidates if c["ok"] and c.get("text")]
     if not successes:
         errs = "; ".join(c.get("error") or "unknown" for c in candidates)
-        return None, f"all swarm agents failed: {errs}"
+        return (
+            None,
+            f"all swarm agents failed: {errs}",
+            _summarize_failed_candidates(candidates),
+        )
 
     winner = None
     rationale = ""
@@ -2400,6 +3097,11 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
     elif strategy == "longest":
         winner = max(successes, key=lambda c: len(c.get("text", "")))
         rationale = "longest non-empty response"
+    elif len(successes) == 1:
+        # best-of-n with a single survivor has nothing to compare; skip the
+        # judge call entirely. Same rationale as the LM Studio gateway.
+        winner = successes[0]
+        rationale = "single successful candidate; judge skipped"
     else:
         labels = [chr(ord("A") + i) for i in range(len(successes))]
         rendered = "\n\n".join(
@@ -2452,17 +3154,12 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
                     preview=_mlx_dash.build_preview(judge_messages),
                 )
             verdict = _extract_text(jresp)
-            picked_idx = None
-            if verdict:
-                for i, lab in enumerate(labels):
-                    if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                        picked_idx = i
-                        break
+            picked_idx = _parse_judge_verdict(verdict, labels)
             if picked_idx is None:
                 winner = max(successes, key=lambda c: len(c.get("text", "")))
                 rationale = (
                     f"judge response unparseable; fell back to longest. "
-                    f"Verdict: {verdict[:140]}"
+                    f"Verdict: {(verdict or '')[:140]}"
                 )
             else:
                 winner = successes[picked_idx]
@@ -2486,7 +3183,7 @@ def _run_swarm_chat_completion(requested_model: str, data: dict, parent_request_
             "requested_model": requested_model,
         },
     }
-    return out, None
+    return out, None, None
 
 
 def _swarm_body_to_sse_response(body: dict, *, chunk_chars: int = SWARM_STREAM_CHUNK_CHARS):
@@ -2580,13 +3277,13 @@ def _auth_guard():
         or (p.startswith("/dashboard/") and not p.startswith("/dashboard/api/"))
     ):
         return None
-    x_api_key = request.headers.get("X-API-Key")
-    authz = request.headers.get("Authorization", "")
-    bearer = authz[len("Bearer "):] if authz.startswith("Bearer ") else None
-    if x_api_key != MIDDLE_LAYER_API_KEY and bearer != MIDDLE_LAYER_API_KEY:
-        return Response(json.dumps({"error": "Unauthorized"}),
-                        status=401, mimetype="application/json")
-    return None
+    if _check_api_key(request.headers, MIDDLE_LAYER_API_KEY):
+        return None
+    return Response(
+        json.dumps({"error": "Unauthorized"}),
+        status=401,
+        mimetype="application/json",
+    )
 
 
 @app.before_request
@@ -2602,6 +3299,12 @@ def _log_request(response):
         "%s %s -> %d (%dms) model=%s",
         request.method, request.path, response.status_code, elapsed, model_routed,
     )
+    return response
+
+
+@app.after_request
+def _security_headers(response):
+    _apply_security_headers(response, path=request.path or "")
     return response
 
 
@@ -2652,6 +3355,13 @@ def healthz():
             "swarm_chat_enabled": bool(SWARM_CHAT_ENABLED),
             "swarm_chat_default_models": SWARM_CHAT_DEFAULT_MODELS,
             "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
+            "swarm_chat_auto_tokens_loaded": sorted(_SWARM_AUTO_LOADED_TOKENS),
+            "swarm_chat_auto_tokens_available": sorted(_SWARM_AUTO_AVAILABLE_TOKENS),
+            "swarm_chat_canonical": _SWARM_CHAT_CANONICAL,
+            "swarm_chat_aliases": {
+                name: {"intent": intent, "deprecated": deprecated}
+                for name, (intent, deprecated) in sorted(_SWARM_CHAT_INTENTS.items())
+            },
             "dashboard": "http://<host>:<port>/dashboard/" if _mlx_dash is not None else None,
             "model_profiles_file": MODEL_PROFILES_PATH if os.path.isfile(MODEL_PROFILES_PATH) else None,
             "mlx_per_model_admission_cap_legacy": _legacy_admission_cap or None,
@@ -2660,7 +3370,26 @@ def healthz():
             "mlx_queue_max_total": MLX_QUEUE_MAX_TOTAL or None,
             "mlx_queue_wait_timeout_sec": MLX_QUEUE_WAIT_TIMEOUT_SEC,
             "mlx_context_over_budget": MLX_CONTEXT_OVER_BUDGET,
-            "generation_timeout_sec": GENERATION_TIMEOUT,
+            # Renamed in 0.1.x from generation_timeout_sec to make the
+            # advisory nature explicit. mlx_lm generation is not safely
+            # cancellable mid-flight, so this value is a soft budget for
+            # logging only — it does not enforce a hard cancel. The
+            # legacy field name is kept for one minor as an alias with
+            # an X-Deprecated marker so clients can migrate.
+            "generation_advisory_timeout_sec": GENERATION_TIMEOUT,
+            "generation_timeout_sec": GENERATION_TIMEOUT,  # deprecated alias
+            "generation_timeout_sec_deprecated": (
+                "renamed to generation_advisory_timeout_sec; will be removed in 0.2.0. "
+                "Note: timeout is advisory (logging only); mlx_lm cannot be "
+                "safely cancelled mid-generation. Use per-request max_tokens "
+                "as the real budget control."
+            ),
+            # Sticky map of "alias X failed to load" entries, populated
+            # by MLXManager.load_model on failure and cleared on
+            # subsequent successful load or explicit unload. Lets
+            # operators diagnose "why isn't model Y serving requests?"
+            # from /healthz alone instead of grep-ing logs.
+            "recent_load_errors": mlx_manager.get_recent_load_errors(),
             "admission": _admission_scheduler.snapshot(),
         }),
         status=200 if ok else 503,
@@ -2699,20 +3428,46 @@ def list_models():
 
 @app.route("/v1/models/<path:alias>", methods=["DELETE"])
 def unload_model(alias):
-    """Explicitly unload a model from memory to free RAM."""
+    """Explicitly unload a model from memory to free RAM.
+
+    Returns:
+      200 + ``unloaded=True``  → model was resident and dropped immediately.
+      202 + ``deferred=True``  → model was in-flight; unload will fire when
+                                 the last holder releases. (HTTP 202 Accepted
+                                 is the correct shape for "request received,
+                                 action queued".)
+      404 + ``unloaded=False`` → model was not loaded to begin with.
+    """
     if _GRAB is not None:
         return Response(
             json.dumps({"error": "Cannot unload in grab mode (single-model)."}),
             status=400, mimetype="application/json",
         )
-    if mlx_manager.unload_model(alias):
+    result = mlx_manager.unload_model(alias)
+    if result["unloaded"]:
         return Response(
             json.dumps({
                 "ok": True,
                 "unloaded": alias,
+                "deferred": False,
                 "resident": mlx_manager.get_loaded_aliases(),
             }),
             status=200, mimetype="application/json",
+        )
+    if result["deferred"]:
+        return Response(
+            json.dumps({
+                "ok": True,
+                "unloaded": None,
+                "deferred": True,
+                "alias": alias,
+                "note": (
+                    f"Model '{alias}' is in-flight; unload deferred until "
+                    "the last active request releases."
+                ),
+                "resident": mlx_manager.get_loaded_aliases(),
+            }),
+            status=202, mimetype="application/json",
         )
     return Response(
         json.dumps({
@@ -2742,26 +3497,62 @@ def _handle_chat_request(data, request_headers=None):
         return _handle_grab_chat(data, dash_rid=dash_rid, request_headers=request_headers)
 
     requested = data.get("model")
-    if SWARM_CHAT_ENABLED and _is_swarm_chat_model(requested):
+    swarm_intent, swarm_canonical = (None, None)
+    if SWARM_CHAT_ENABLED:
+        swarm_intent, swarm_canonical = _swarm_chat_intent(requested)
+
+    if swarm_intent is not None:
+        # ``pipeline`` is a 400 (caller misuse), not a 502 (upstream
+        # failure) — same convention as the LM Studio gateway.
+        if swarm_intent == "pipeline":
+            _body, err_msg, _ = _run_swarm_chat_completion(
+                str(requested), data, parent_request_id=dash_rid, intent="pipeline",
+            )
+            return Response(
+                json.dumps({"error": err_msg, "redirect": "POST /swarm/pipeline"}),
+                status=400,
+                mimetype="application/json",
+            )
+
         wants_stream = data.get("stream") is True
-        body, swarm_err = _run_swarm_chat_completion(
+        body, swarm_err, swarm_err_details = _run_swarm_chat_completion(
             str(requested),
             data,
             parent_request_id=dash_rid,
+            intent=swarm_intent,
         )
         if swarm_err or not body:
+            err_body: dict = {"error": f"Swarm routing failed: {swarm_err}"}
+            if swarm_err_details:
+                err_body["error_details"] = swarm_err_details
+            err_headers: dict = {}
+            if swarm_canonical and swarm_canonical.lower() != str(requested).strip().lower():
+                err_headers["X-Swarm-Canonical-Name"] = swarm_canonical
+            if isinstance(swarm_err_details, dict):
+                kinds = swarm_err_details.get("kinds") or {}
+                if kinds:
+                    err_headers["X-Swarm-Error-Kinds"] = ",".join(
+                        f"{k}={v}" for k, v in sorted(kinds.items())
+                    )
             return Response(
-                json.dumps({"error": f"Swarm routing failed: {swarm_err}"}),
+                json.dumps(err_body),
                 status=502,
                 mimetype="application/json",
+                headers=err_headers or None,
             )
         if wants_stream:
             return _swarm_body_to_sse_response(body)
+        resp_headers = {
+            "X-Model-Routed-To": str(body.get("model", "swarm/unknown")),
+            "X-Swarm-Intent": swarm_intent,
+        }
+        if swarm_canonical and swarm_canonical.lower() != str(requested).strip().lower():
+            resp_headers["X-Swarm-Canonical-Name"] = swarm_canonical
         return Response(
             json.dumps(body),
             status=200,
             mimetype="application/json",
-            headers={"X-Model-Routed-To": str(body.get("model", "swarm/unknown"))},
+            headers=resp_headers,
         )
 
     # Anthropic escalation for big non-code tasks (matches middle_layer.py)
@@ -2902,6 +3693,24 @@ def _handle_chat_request(data, request_headers=None):
             return _admission_err_response(load_err, 503)
         return _admission_err_response(f"Could not load MLX model '{alias}'", 503)
 
+    # Pin the alias for the duration of this request (and the streaming
+    # generator's lifetime if streaming). Released in the streaming
+    # generator's finally OR the non-streaming finally below — never
+    # both. We pin AFTER load_model so the load itself can still
+    # trigger LRU eviction of a different alias if needed.
+    mlx_manager.pin_alias(alias)
+    pin_released = False
+
+    def _release_pin_once():
+        nonlocal pin_released
+        if not pin_released:
+            pin_released = True
+            mlx_manager.release_pin(alias)
+
+    def _pin_err_response(msg: str, code: int = 400):
+        _release_pin_once()
+        return _admission_err_response(msg, code)
+
     model, tokenizer, gen_lock = handle
     profile = get_model_profile(alias)
     messages = data.get("messages", [])
@@ -2921,9 +3730,9 @@ def _handle_chat_request(data, request_headers=None):
         MLX_CONTEXT_TRIM_BUFFER,
     )
     if trim_err:
-        return _admission_err_response(trim_err, 400)
+        return _pin_err_response(trim_err, 400)
     if not formatted:
-        return _admission_err_response("empty prompt", 400)
+        return _pin_err_response("empty prompt", 400)
 
     max_tokens = _clamp_max_tokens(data.get("max_tokens"), profile)
     cw = int(profile.get("context_window") or 8192)
@@ -2931,7 +3740,7 @@ def _handle_chat_request(data, request_headers=None):
         prompt_tok, max_tokens, cw, MLX_CONTEXT_TRIM_BUFFER,
     )
     if impossible:
-        return _admission_err_response(
+        return _pin_err_response(
             f"No completion budget left (prompt_tokens≈{prompt_tok}, context_window={cw}). "
             "Shorten the prompt or choose a larger-context model.",
             400,
@@ -3050,6 +3859,7 @@ def _handle_chat_request(data, request_headers=None):
                         _mlx_dash.metrics_store.active_exit(alias)
             finally:
                 _admission_release(alias)
+                _release_pin_once()
 
         headers = {"X-Model-Routed-To": f"mlx/{alias}"}
         if fallback_from:
@@ -3070,30 +3880,28 @@ def _handle_chat_request(data, request_headers=None):
                     model, tokenizer, formatted, max_tokens, temperature, top_p,
                     timeout_sec=GENERATION_TIMEOUT,
                 )
-            except TimeoutError as e:
-                elapsed = int((time.perf_counter() - t0) * 1000)
-                if _mlx_dash is not None:
-                    _mlx_dash.record_event(
-                        request_id=dash_rid,
-                        parent_request_id=None,
-                        agent_slot=None,
-                        route_kind="chat_mlx",
-                        requested_model=req_str,
-                        resolved_model=str(alias),
-                        backend="mlx",
-                        stream=False,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=max(1, elapsed),
-                        status="error",
-                        error_message=str(e),
-                        preview=_mlx_dash.build_preview(msgs),
-                    )
-                return Response(json.dumps({"error": str(e)}),
-                                status=504, mimetype="application/json")
             except Exception as e:
+                # _mlx_generate_text_timed treats timeout_sec as a soft
+                # budget for logging; it never raises TimeoutError
+                # (mlx_lm generation is not safely cancellable
+                # mid-flight). All real generation failures land here.
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                # Audit finding: non-stream generation failures used to
+                # return 500 to the client with no server-side log line
+                # (only dashboard record_event). If the dashboard isn't
+                # enabled, the operator had no signal from logs alone.
+                # Log at WARNING with alias + request_id BEFORE the
+                # response is built so the line is always emitted even
+                # if dashboard recording itself fails.
+                log.warning(
+                    "MLX generation failed: alias=%s request_id=%s "
+                    "exc_type=%s elapsed_ms=%d msg=%s",
+                    alias,
+                    dash_rid,
+                    type(e).__name__,
+                    elapsed,
+                    str(e)[:200],
+                )
                 if _mlx_dash is not None:
                     _mlx_dash.record_event(
                         request_id=dash_rid,
@@ -3118,6 +3926,7 @@ def _handle_chat_request(data, request_headers=None):
         if _mlx_dash is not None:
             _mlx_dash.metrics_store.active_exit(alias)
         _admission_release(alias)
+        _release_pin_once()
 
     elapsed = int((time.perf_counter() - t0) * 1000)
 
@@ -3270,6 +4079,8 @@ def swarm_models():
             "swarm_chat_enabled": bool(SWARM_CHAT_ENABLED),
             "swarm_chat_default_models": SWARM_CHAT_DEFAULT_MODELS,
             "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
+            "swarm_chat_auto_tokens_loaded": sorted(_SWARM_AUTO_LOADED_TOKENS),
+            "swarm_chat_auto_tokens_available": sorted(_SWARM_AUTO_AVAILABLE_TOKENS),
         }),
         status=200, mimetype="application/json",
     )
@@ -3289,12 +4100,22 @@ def swarm_fanout():
     data = request.get_json(silent=True) or {}
     models = data.get("models") or []
     messages = data.get("messages") or []
-    if not isinstance(models, list) or not models:
-        return Response(json.dumps({"error": "models (list) is required"}),
+    if not isinstance(models, (list, str)) or not models:
+        return Response(json.dumps({"error": "models (list, or 'auto') is required"}),
                         status=400, mimetype="application/json")
     if not isinstance(messages, list) or not messages:
         return Response(json.dumps({"error": "messages (list) is required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if not models:
+        return Response(
+            json.dumps({"error": "no MLX models loaded or configured; pass explicit models"}),
+            status=503, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
     common = {k: v for k, v in common.items() if v is not None}
@@ -3330,9 +4151,20 @@ def swarm_vote():
     models = data.get("models") or []
     messages = data.get("messages") or []
     strategy = (data.get("strategy") or "best-of-n").lower()
-    if not (isinstance(models, list) and models and isinstance(messages, list) and messages):
+    models_ok = isinstance(models, (list, str)) and models
+    if not (models_ok and isinstance(messages, list) and messages):
         return Response(json.dumps({"error": "models and messages are required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if not models:
+        return Response(
+            json.dumps({"error": "no MLX models loaded or configured; pass explicit models"}),
+            status=503, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p") if data.get(k) is not None}
     swarm_parent_id = str(uuid.uuid4())
@@ -3411,16 +4243,11 @@ def swarm_vote():
                     preview=_mlx_dash.build_preview(judge_messages),
                 )
             verdict = _extract_text(jresp)
-            picked_idx = None
-            if verdict:
-                for i, lab in enumerate(labels):
-                    if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                        picked_idx = i
-                        break
+            picked_idx = _parse_judge_verdict(verdict, labels)
             if picked_idx is None:
                 winner = max(successes, key=lambda c: len(c.get("text", "")))
                 rationale = (f"judge response unparseable; fell back to longest. "
-                             f"Verdict: {verdict[:140]}")
+                             f"Verdict: {(verdict or '')[:140]}")
             else:
                 winner = successes[picked_idx]
                 rationale = verdict.strip()
@@ -3473,23 +4300,17 @@ def swarm_pipeline():
         ctx = {h["name"]: h["text"] for h in history}
         ctx["previous"] = last_text
 
-        def _fmt(template):
-            if not isinstance(template, str):
-                return template
-            t = re.sub(r"\{\{(\w+)\}\}", r"{\1}", template)
-            try:
-                return t.format(**ctx)
-            except (KeyError, IndexError):
-                return template
-
-        sys_prompt = _fmt(step.get("system") or "")
+        sys_prompt = _substitute_pipeline_template(step.get("system") or "", ctx)
         user_template = step.get("user")
 
         agent_messages = []
         if sys_prompt:
             agent_messages.append({"role": "system", "content": sys_prompt})
         if user_template:
-            agent_messages.append({"role": "user", "content": _fmt(user_template)})
+            agent_messages.append({
+                "role": "user",
+                "content": _substitute_pipeline_template(user_template, ctx),
+            })
         else:
             agent_messages += [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
 
@@ -3569,12 +4390,22 @@ def swarm_debate():
     rounds = data.get("rounds", 2)
     judge_model = data.get("judge", "role:reasoner")
 
-    if not isinstance(models, list) or len(models) < 2:
-        return Response(json.dumps({"error": "debate requires at least 2 models"}),
+    if not isinstance(models, (list, str)) or not models:
+        return Response(json.dumps({"error": "debate requires a non-empty models list (or 'auto')"}),
                         status=400, mimetype="application/json")
     if not isinstance(messages, list) or not messages:
         return Response(json.dumps({"error": "messages (list) is required"}),
                         status=400, mimetype="application/json")
+
+    models, exp_err = _expand_swarm_models(models)
+    if exp_err:
+        return Response(json.dumps({"error": exp_err}),
+                        status=503, mimetype="application/json")
+    if len(models) < 2:
+        return Response(
+            json.dumps({"error": "debate requires at least 2 models after expansion"}),
+            status=400, mimetype="application/json",
+        )
 
     common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p") if data.get(k) is not None}
     available = mlx_manager.get_available_aliases()
@@ -3747,25 +4578,33 @@ def _preload_and_validate(aliases_to_preload: list[str]):
         if err or not resolved:
             log.warning("Preload '%s' skipped: %s", alias, err)
             continue
-        handle = mlx_manager.load_model(resolved)
-        if handle is None:
-            load_err = mlx_manager.get_last_load_error(resolved)
-            if load_err:
-                log.warning("Preload '%s' failed to load: %s", resolved, load_err)
-            else:
-                log.warning("Preload '%s' failed to load", resolved)
-            continue
-        model, tokenizer, gen_lock = handle
-        try:
-            with gen_lock:
-                _mlx_generate_text(model, tokenizer, "Hello", 4)
-            log.info("Preload '%s' verified OK", resolved)
-        except Exception as e:
-            log.warning("Preload '%s' loaded but self-test failed: %s", resolved, e)
+        # acquire_inference_handle pins the alias during the self-test
+        # so a concurrent dashboard load or LRU pressure can't evict
+        # the freshly-loaded model out from under the generate() call.
+        with mlx_manager.acquire_inference_handle(resolved) as handle:
+            if handle is None:
+                load_err = mlx_manager.get_last_load_error(resolved)
+                if load_err:
+                    log.warning("Preload '%s' failed to load: %s", resolved, load_err)
+                else:
+                    log.warning("Preload '%s' failed to load", resolved)
+                continue
+            model, tokenizer, gen_lock = handle
+            try:
+                with gen_lock:
+                    _mlx_generate_text(model, tokenizer, "Hello", 4)
+                log.info("Preload '%s' verified OK", resolved)
+            except Exception as e:
+                log.warning("Preload '%s' loaded but self-test failed: %s", resolved, e)
 
 
 def _download_model(repo_id: str) -> int:
-    """Download a Hugging Face model and exit."""
+    """Download a Hugging Face model and exit.
+
+    Returns a process exit code: 0 on success, 1 on any failure
+    (missing huggingface_hub, network error, partial download).
+    Audit finding: failures used to surface as raw tracebacks.
+    """
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -3779,9 +4618,25 @@ def _download_model(repo_id: str) -> int:
     dest = os.path.join(cache_root, local_name)
     os.makedirs(dest, exist_ok=True)
     log.info("Downloading %r -> %s", repo_id, dest)
-    snapshot_download(repo_id=repo_id, local_dir=dest, local_dir_use_symlinks=False)
+    try:
+        snapshot_download(repo_id=repo_id, local_dir=dest, local_dir_use_symlinks=False)
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "Hugging Face download failed for %r: %s. Partial files may "
+            "remain under %s; delete that directory and retry, or check "
+            "network/credentials.",
+            repo_id,
+            e,
+            dest,
+        )
+        return 1
     if not os.path.isfile(os.path.join(dest, "config.json")):
-        log.error("Download finished but config.json missing under %s", dest)
+        log.error(
+            "Download completed for %r but config.json is missing under %s. "
+            "The repo may not contain a self-contained MLX model layout.",
+            repo_id,
+            dest,
+        )
         return 1
     log.info("Download complete: %s", dest)
     log.info("Serve with: python middle_layerMLX.py serve --grab %s", dest)
@@ -3837,8 +4692,42 @@ def _build_cli() -> argparse.ArgumentParser:
     return p
 
 
+def _validate_boot_knobs() -> None:
+    """Fail fast on invalid knob values before we start touching MLX.
+
+    The historical defaults silently produced runtime crashes (e.g.
+    MAX_CONCURRENT_MODELS=0 → KeyError on the first load because
+    ``OrderedDict.popitem(last=False)`` was called on an empty dict
+    inside ``_ensure_capacity_locked``). Surfacing those at startup
+    with a clear, actionable message is strictly better than waiting
+    for the first chat request to crash with a confusing traceback.
+    """
+    if MAX_CONCURRENT_MODELS < 1:
+        raise SystemExit(
+            f"MAX_CONCURRENT_MODELS={MAX_CONCURRENT_MODELS} is invalid: "
+            "must be >= 1 (the LRU eviction loop requires at least one "
+            "resident slot). Set MAX_CONCURRENT_MODELS to 1 or higher "
+            "and restart."
+        )
+    if MAX_PARALLEL_MODEL_CALLS < 1:
+        raise SystemExit(
+            f"MAX_PARALLEL_MODEL_CALLS={MAX_PARALLEL_MODEL_CALLS} is invalid: "
+            "must be >= 1 (swarm fanout requires at least one worker). "
+            "Set MAX_PARALLEL_MODEL_CALLS to 1 or higher and restart."
+        )
+    if MLX_PER_MODEL_INFLIGHT_CAP < 0:
+        raise SystemExit(
+            f"MLX_PER_MODEL_INFLIGHT_CAP={MLX_PER_MODEL_INFLIGHT_CAP} is "
+            "invalid: must be >= 0 (0 disables admission, 1+ caps "
+            "concurrent inferences per alias). Set to 0 to disable "
+            "admission or 1+ to enable and restart."
+        )
+
+
 def main():
     global MLX_MODEL_ROOT, mlx_manager, DEFAULT_MODEL
+
+    _validate_boot_knobs()
 
     parser = _build_cli()
     args = parser.parse_args()
@@ -3879,9 +4768,21 @@ def main():
         )
 
     if chosen_root:
-        MLX_MODEL_ROOT = os.path.abspath(os.path.expanduser(chosen_root))
-        os.environ["MLX_MODEL_ROOT"] = MLX_MODEL_ROOT
-        mlx_manager = MLXManager(MLX_MODEL_ROOT)
+        new_root = os.path.abspath(os.path.expanduser(chosen_root))
+        if new_root != mlx_manager.root_path:
+            # Audit finding: main() used to unconditionally re-instantiate
+            # MLXManager even when chosen_root resolved to the same abspath
+            # as the import-time manager — wasting a full directory walk.
+            # Now we only rebuild when the path actually changes.
+            MLX_MODEL_ROOT = new_root
+            os.environ["MLX_MODEL_ROOT"] = MLX_MODEL_ROOT
+            mlx_manager = MLXManager(MLX_MODEL_ROOT)
+        else:
+            log.debug(
+                "main(): chosen_root %s already matches import-time mlx_manager; "
+                "skipping redundant MLXManager construction",
+                new_root,
+            )
 
     if not MLX_AVAILABLE:
         log.warning("mlx_lm is not installed. /v1/* and /swarm/* MLX paths will 503.")
@@ -3955,10 +4856,17 @@ def main():
     host = args.host
     port = args.port
 
+    try:
+        _enforce_safe_bind(host, MIDDLE_LAYER_API_KEY)
+    except _PublicBindWithoutAuthError as exc:
+        log.error("%s", exc)
+        sys.exit(2)
+
     _configure_mlx_dashboard(register_blueprint=False)
     if _mlx_dash is not None:
         log.info("Dashboard: http://%s:%d/dashboard/ (set MLX_DASHBOARD_ENABLED=0 to disable)", host, port)
     log.info("Listening on %s:%d", host, port)
+    log.info("Max request body: %d bytes", app.config["MAX_CONTENT_LENGTH"])
     app.run(host=host, port=port, debug=False, threaded=True)
 
 
