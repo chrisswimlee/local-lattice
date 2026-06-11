@@ -60,17 +60,16 @@ CACHE_TTL_SECONDS = 60
 # Multi-model & swarm configuration
 # ---------------------------------------------------------------------------
 
-# Cache of every configured LM Studio model id (used by the resolver and swarm).
-_cached_model_ids = None
-_cached_model_ids_ts = 0
-# Separate cache of currently-loaded ids (state=loaded via /api/v0/models). Empty
-# list means "queried successfully and nothing is loaded"; None means "not yet
-# probed, or last probe errored". A short TTL is fine — operators load/unload
-# models slowly compared to RPS.
-_cached_loaded_ids = None
-_cached_loaded_ids_ts = 0
-_loaded_endpoint_supported = True
+# The HTTP client (probes + chat call + per-instance caches) lives in
+# ``middle_layer/lmstudio_client.py`` (Pass 3); the gateway keeps one
+# instance plus thin module-level wrappers so historical monkey-patching
+# of ``mod.get_lmstudio_model_ids`` et al. keeps working.
 MODEL_LIST_TTL = int(os.environ.get("MODEL_LIST_TTL", "30"))
+
+from middle_layer.lmstudio_client import LMStudioClient  # noqa: E402
+from middle_layer.lmstudio_client import is_chat_capable_model_id  # noqa: E402, F401
+
+_LMSTUDIO = LMStudioClient(LM_STUDIO_URL, model_list_ttl=MODEL_LIST_TTL)
 
 # Prefer LM Studio model ids that are already loaded over not-loaded ones.
 # Three modes:
@@ -260,156 +259,21 @@ def get_lmstudio_model_ids(force_refresh: bool = False):
     model id on the LM Studio server, in the order LM Studio reports them.
     Briefly cached (MODEL_LIST_TTL) so swarm fanouts don't hammer the API.
     """
-    global _cached_model_ids, _cached_model_ids_ts
-
-    now = time.time()
-    if (
-        not force_refresh
-        and _cached_model_ids is not None
-        and (now - _cached_model_ids_ts) < MODEL_LIST_TTL
-    ):
-        return list(_cached_model_ids), None
-
-    try:
-        response = requests.get(LM_STUDIO_MODELS_ENDPOINT, timeout=5)
-        if response.status_code != 200:
-            return [], f"LM Studio models endpoint returned {response.status_code}"
-
-        data = response.json()
-        ids = []
-
-        # Shape A: OpenAI-like {"data":[{"id":"..."}]}
-        if isinstance(data, dict) and isinstance(data.get("data"), list):
-            for entry in data["data"]:
-                if isinstance(entry, dict) and entry.get("id"):
-                    ids.append(entry["id"])
-
-        # Shape B: {"models":[{"loaded_instances":[{"id":"..."}], "id": "..."}]}
-        if not ids and isinstance(data, dict) and isinstance(data.get("models"), list):
-            for entry in data["models"]:
-                if not isinstance(entry, dict):
-                    continue
-                loaded = entry.get("loaded_instances", [])
-                if isinstance(loaded, list) and loaded:
-                    for inst in loaded:
-                        if isinstance(inst, dict) and inst.get("id"):
-                            ids.append(inst["id"])
-                elif entry.get("id"):
-                    ids.append(entry["id"])
-
-        # De-dupe while preserving order.
-        seen = set()
-        deduped = []
-        for mid in ids:
-            if mid not in seen:
-                seen.add(mid)
-                deduped.append(mid)
-
-        _cached_model_ids = deduped
-        _cached_model_ids_ts = now
-        return list(deduped), None
-
-    except requests.exceptions.ConnectionError:
-        return [], "Cannot connect to LM Studio. Is it running?"
-    except requests.exceptions.Timeout:
-        return [], "Timeout connecting to LM Studio."
-    except Exception as e:
-        return [], f"Error discovering models: {str(e)}"
+    return _LMSTUDIO.get_model_ids(force_refresh=force_refresh)
 
 
 def get_loaded_lmstudio_model_ids(force_refresh: bool = False):
     """Return (loaded_ids, error) using LM Studio's ``/api/v0/models`` endpoint
-    (which exposes per-instance ``state``). Falls back to "" if the endpoint
-    isn't supported (older LM Studio); the caller should then degrade to
-    ``get_lmstudio_model_ids`` and treat all installed ids as candidates.
-
-    A short cache (``MODEL_LIST_TTL``) prevents swarm fanouts from hammering
-    the API. Once we observe that ``/api/v0/models`` 404s or otherwise fails,
-    we stop probing for the rest of the process.
+    (which exposes per-instance ``state``). Degrades gracefully when the
+    endpoint isn't supported (older LM Studio) — see
+    ``middle_layer.lmstudio_client.LMStudioClient.get_loaded_model_ids``.
     """
-    global _cached_loaded_ids, _cached_loaded_ids_ts, _loaded_endpoint_supported
-
-    if not _loaded_endpoint_supported:
-        return [], None
-
-    now = time.time()
-    if (
-        not force_refresh
-        and _cached_loaded_ids is not None
-        and (now - _cached_loaded_ids_ts) < MODEL_LIST_TTL
-    ):
-        return list(_cached_loaded_ids), None
-
-    try:
-        response = requests.get(f"{LM_STUDIO_URL}/api/v0/models", timeout=5)
-    except requests.exceptions.ConnectionError:
-        return [], "Cannot connect to LM Studio. Is it running?"
-    except requests.exceptions.Timeout:
-        return [], "Timeout connecting to LM Studio."
-    except Exception as e:
-        return [], f"Error discovering loaded models: {str(e)}"
-
-    if response.status_code == 404:
-        # Older LM Studio without the /api/v0 surface. Stop probing.
-        _loaded_endpoint_supported = False
-        _cached_loaded_ids = []
-        _cached_loaded_ids_ts = now
-        return [], None
-    if response.status_code != 200:
-        return [], f"LM Studio /api/v0/models returned {response.status_code}"
-
-    try:
-        data = response.json()
-    except Exception as e:
-        return [], f"Error parsing LM Studio /api/v0/models: {e}"
-
-    loaded = []
-    for entry in (data.get("data") or []) if isinstance(data, dict) else []:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("state") == "loaded" and entry.get("id"):
-            loaded.append(entry["id"])
-
-    seen = set()
-    deduped = []
-    for mid in loaded:
-        if mid not in seen:
-            seen.add(mid)
-            deduped.append(mid)
-
-    _cached_loaded_ids = deduped
-    _cached_loaded_ids_ts = now
-    return list(deduped), None
-
-
-# Heuristic for filtering embedding / non-chat-capable model ids out of
-# swarm fanouts. LM Studio's /api/v0/models *does* carry a ``type`` field
-# (``llm``/``vlm``/``embeddings``), but the older ``/v1/models`` endpoint
-# doesn't, and we want this filter to work regardless of which probe the
-# loaded-ids list came from. Matches the common embedding-model naming
-# conventions we see on LM Studio (``text-embedding-...``,
-# ``nomic-embed-...``, ``bge-...``, ``e5-...``, anything with a literal
-# ``embed`` token in its id segment). Erring on the side of false positives
-# is acceptable here — operators can always pass an explicit
-# ``swarm.models`` list to bypass the filter.
-_EMBED_ID_HINT = re.compile(
-    r"(?ix) (?:^|[/_-]) (?:embed|embedding|embeddings|nomic-embed|bge|e5) (?:[/_-]|$)"
-)
-
-
-def is_chat_capable_model_id(model_id) -> bool:
-    """Best-effort guess at whether a loaded LM Studio model id can serve
-    ``/v1/chat/completions``. Used by the ``auto``-expansion of
-    ``SWARM_CHAT_DEFAULT_MODELS`` so swarm fanouts don't waste a slot on
-    embedding models (which return 400 for chat completions and would just
-    increment the failure column).
-    """
-    if not isinstance(model_id, str):
-        return False
-    return _EMBED_ID_HINT.search(model_id) is None
+    return _LMSTUDIO.get_loaded_model_ids(force_refresh=force_refresh)
 
 
 # Back-compat alias for callers that imported the underscore-prefixed name.
+# (``is_chat_capable_model_id`` itself is re-exported from
+# ``middle_layer.lmstudio_client`` at the top of this file.)
 _is_chat_capable_model_id = is_chat_capable_model_id
 
 
@@ -728,7 +592,7 @@ def healthz():
                 "lmstudio_model": ids[0] if ids else None,
                 "lmstudio_models": ids,
                 "lmstudio_loaded_models": loaded,
-                "lmstudio_loaded_endpoint_supported": _loaded_endpoint_supported,
+                "lmstudio_loaded_endpoint_supported": _LMSTUDIO.loaded_endpoint_supported,
                 "lmstudio_loaded_error": lerr,
                 "lmstudio_error": err,
                 "model_roles": MODEL_ROLES,
@@ -1048,25 +912,8 @@ def proxy(endpoint):
 def _lmstudio_chat_completion(model_id, messages, **kwargs):
     """Call LM Studio /v1/chat/completions for a single model.
     Returns (openai_shaped_response_json, error_str)."""
-    payload = {"model": model_id, "messages": messages, "stream": False}
-    for k in ("max_tokens", "temperature", "top_p", "stop"):
-        if kwargs.get(k) is not None:
-            payload[k] = kwargs[k]
-
-    try:
-        r = requests.post(
-            f"{LM_STUDIO_URL}/v1/chat/completions",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload).encode("utf-8"),
-            timeout=kwargs.get("timeout", SWARM_PER_CALL_TIMEOUT),
-        )
-        if r.status_code >= 400:
-            return None, f"LM Studio {r.status_code}: {r.text[:300]}"
-        return r.json(), None
-    except requests.exceptions.Timeout:
-        return None, "Timeout calling LM Studio"
-    except Exception as e:
-        return None, f"Error calling LM Studio: {e}"
+    kwargs.setdefault("timeout", SWARM_PER_CALL_TIMEOUT)
+    return _LMSTUDIO.chat_completion(model_id, messages, **kwargs)
 
 
 def _call_anthropic_chat(messages, model_override=None, **kwargs):
