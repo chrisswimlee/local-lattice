@@ -242,7 +242,7 @@ def is_well_formed_alias(value: object) -> bool:
     return True
 
 
-def alias_in_allowlist(value: str, allowlist: Iterable[str]) -> bool:
+def alias_in_allowlist(value: object, allowlist: Iterable[str]) -> bool:
     """True if ``value`` exactly matches an entry in ``allowlist``."""
     if not isinstance(value, str):
         return False
