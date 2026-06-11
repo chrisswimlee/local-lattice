@@ -299,6 +299,10 @@ A full threat model and the responsible-disclosure address live in
 
 ## Docs
 
+- [`llms.txt`](./llms.txt) — **self-contained integration guide for AI
+  agents**: feed this one file to a coding agent and it has every
+  endpoint shape, the `model` grammar, and the error contract needed to
+  integrate without human help.
 - [`docs/why-lattice.md`](./docs/why-lattice.md) — the longer "why this
   exists" story: capability routing as an agent-infra primitive.
 - [`docs/capabilities.md`](./docs/capabilities.md) — formal spec of the
