@@ -1,0 +1,229 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# Project metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "local-lattice"
+version = "0.2.0"
+description = "Local Lattice — MLX-native OpenAI-compatible gateway with capability routing, admission queue, and a hybrid local+cloud swarm."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "The Local Lattice Authors" },
+]
+keywords = [
+    "mlx",
+    "apple-silicon",
+    "openai-compatible",
+    "inference-gateway",
+    "swarm",
+    "lm-studio",
+    "anthropic",
+    "llm",
+    "self-hosted",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# Core dependencies are what every install needs regardless of backend.
+# Backend-specific runtimes live under the extras below.
+dependencies = [
+    "flask>=3.0",
+    "requests>=2.28",
+]
+
+[project.urls]
+Homepage = "https://github.com/chrisswimlee/local-lattice"
+Repository = "https://github.com/chrisswimlee/local-lattice"
+Issues = "https://github.com/chrisswimlee/local-lattice/issues"
+Changelog = "https://github.com/chrisswimlee/local-lattice/blob/main/CHANGELOG.md"
+
+# ---------------------------------------------------------------------------
+# Optional extras — pick what you actually need.
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+# Apple-Silicon-only MLX backend (the canonical path).
+mlx = [
+    "mlx-lm>=0.19",
+    "huggingface_hub>=0.20",
+    "flask-cors>=5.0",
+]
+
+# Legacy LM Studio proxy backend (works on any platform).
+lmstudio = [
+    "flask-cors>=5.0",
+    "gunicorn>=22.0",
+]
+
+# Optional Anthropic Opus escalation via LiteLLM.
+anthropic = [
+    "litellm>=1.40",
+]
+
+# In-process observability dashboard (no extra deps today; included for
+# completeness so docs can recommend `pip install local-lattice[dashboard]`).
+dashboard = []
+
+# Development and contributor tooling.
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "build>=1.2",
+]
+
+# Everything that can run cross-platform. Notably excludes `mlx` because
+# `mlx-lm` requires Apple Silicon and would fail to install elsewhere.
+all = [
+    "local-lattice[lmstudio,anthropic,dashboard,dev]",
+]
+
+# ---------------------------------------------------------------------------
+# Console scripts
+# ---------------------------------------------------------------------------
+[project.scripts]
+# Canonical names (match PyPI distribution `local-lattice`).
+local-lattice-mlx = "middle_layer.cli:main_mlx"
+local-lattice-lmstudio = "middle_layer.cli:main_lmstudio"
+# Back-compat shims (same entry points; remove after one minor per AGENTS.md).
+middle-layer-mlx = "middle_layer.cli:main_mlx"
+middle-layer-lmstudio = "middle_layer.cli:main_lmstudio"
+
+# ---------------------------------------------------------------------------
+# Hatch build configuration
+# ---------------------------------------------------------------------------
+[tool.hatch.version]
+path = "middle_layer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# The new package is the primary build target. The legacy top-level
+# modules and their assets are force-included next to the package so
+# `pip install local-lattice[mlx]` produces a working install that
+# `local-lattice-mlx serve --help` (or `middle-layer-mlx`) can dispatch into (see
+# `middle_layer.cli._legacy_main`). Pass 3 will absorb these files into
+# the package itself and drop the force-include block.
+packages = ["middle_layer"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"middle_layerMLX.py" = "middle_layerMLX.py"
+"middle_layer.py" = "middle_layer_lmstudio.py"
+"mlx_dashboard.py" = "mlx_dashboard.py"
+"model_profiles.json" = "model_profiles.json"
+"mlx_roles.json" = "mlx_roles.json"
+"dashboard/index.html" = "dashboard/index.html"
+"dashboard/app.js" = "dashboard/app.js"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/middle_layer",
+    "/tests",
+    "/middle_layerMLX.py",
+    "/middle_layer.py",
+    "/mlx_dashboard.py",
+    "/model_profiles.json",
+    "/mlx_roles.json",
+    "/dashboard",
+    "/scripts",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/CODE_OF_CONDUCT.md",
+    "/SECURITY.md",
+    "/AGENTS.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/pyproject.toml",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff: linter + formatter. Configuration is intentionally conservative
+# for Pass 1; Pass 5 ratchets `select` and turns on `--strict`.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "docs/_internal",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",  # line length — handled by formatter
+    "B008",  # function calls in argument defaults — common Flask pattern
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# ---------------------------------------------------------------------------
+# Pytest. Pass 5 expands this with coverage gates and timeout defaults.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "slow: marks tests that take more than ~1s (use `-m 'not slow'` to skip)",
+    "mlx: tests that require a working `mlx_lm` install (skipped on non-Apple-Silicon)",
+    "network: tests that hit a real upstream (skipped in CI without `--run-network`)",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:flask",
+    "ignore::DeprecationWarning:werkzeug",
+]
+
+# ---------------------------------------------------------------------------
+# Mypy. Strict mode is the target by end of Pass 3 (P3-05); for now we
+# just require explicit-package-bases so `middle_layer/` is checked
+# without the legacy top-level files dragging in untyped symbols.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+explicit_package_bases = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+strict_equality = true
+check_untyped_defs = true
+files = ["middle_layer"]
+
+[[tool.mypy.overrides]]
+module = ["mlx_lm.*", "litellm.*", "flask_cors.*", "huggingface_hub.*"]
+ignore_missing_imports = true

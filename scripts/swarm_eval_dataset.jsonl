@@ -1,0 +1,10 @@
+{"id": "math-01", "prompt": "What is 17 * 23? Reply with only the number.", "expected": "391", "grader": "substring"}
+{"id": "math-02", "prompt": "A train leaves at 9:15am and arrives at 2:42pm. How many minutes was the trip? Reply with only the number.", "expected": "327", "grader": "substring"}
+{"id": "math-03", "prompt": "What is the next number in the sequence 2, 6, 12, 20, 30, ...? Reply with only the number.", "expected": "42", "grader": "substring"}
+{"id": "code-01", "prompt": "Write Python code that returns the factorial of 10. Then on a new line write 'RESULT=' followed by the value.", "expected": "RESULT=3628800", "grader": "substring"}
+{"id": "code-02", "prompt": "What does this Python expression evaluate to: sum(i*i for i in range(1, 6))? Reply with only the number.", "expected": "55", "grader": "substring"}
+{"id": "fact-01", "prompt": "What chemical element has the atomic number 79?", "expected": "gold", "grader": "substring"}
+{"id": "fact-02", "prompt": "In which year did Apollo 11 land on the moon? Reply with just the year.", "expected": "1969", "grader": "substring"}
+{"id": "reason-01", "prompt": "A bat and a ball cost $1.10 together. The bat costs $1 more than the ball. How much does the ball cost? Reply with just the dollar amount.", "expected": "0.05", "grader": "substring"}
+{"id": "reason-02", "prompt": "Alice is older than Bob. Bob is older than Carol. Carol is older than Dave. Who is the youngest?", "expected": "Dave", "grader": "substring"}
+{"id": "open-01", "prompt": "Summarize Bayesian inference in one sentence aimed at a software engineer.", "expected": null, "grader": "llm_judge"}

@@ -1,0 +1,11 @@
+# DEPRECATED — use `pip install local-lattice[mlx]` instead.
+#
+# This file is a thin compatibility shim kept for one minor version so
+# existing tooling that runs `pip install -r requirements-mlx.txt`
+# continues to work. It installs the project in editable mode with the
+# `[mlx]` extra, which is the new source of truth for the MLX runtime
+# dependency set. See `pyproject.toml` for the full list.
+#
+# Will be removed in 0.3.0.
+
+--editable .[mlx]
