@@ -1,0 +1,147 @@
+# Local Lattice — integration guide for AI agents
+
+This file is written for coding agents and LLM-based tools that want to
+use a running Local Lattice gateway. It is self-contained: everything you
+need to integrate is below. Human-oriented docs: README.md,
+docs/capabilities.md, docs/integrations/.
+
+## What you are talking to
+
+An OpenAI-compatible HTTP gateway in front of local models. You never
+hardcode a model id; you request a *capability* and the gateway resolves
+it against whatever is actually loaded on the operator's machine.
+
+Two interchangeable backends, same HTTP surface:
+
+- LM Studio proxy gateway — default `http://127.0.0.1:5000`
+- MLX direct gateway (Apple Silicon) — default `http://127.0.0.1:5001`
+
+Auth (only if the operator set `MIDDLE_LAYER_API_KEY`): send either
+`X-API-Key: <key>` or `Authorization: Bearer <key>` on every request.
+No key configured = no auth required.
+
+## Minimal integration
+
+Use any OpenAI client; override the base URL. Example (Python):
+
+    from openai import OpenAI
+    client = OpenAI(base_url="http://127.0.0.1:5000/v1", api_key="<key-or-dummy>")
+    resp = client.chat.completions.create(
+        model="role:coder",          # capability, not a model id
+        messages=[{"role": "user", "content": "..."}],
+        max_tokens=2000,
+    )
+    print(resp.model)                # the concrete model id that answered
+
+## The "model" field grammar
+
+    model        := "" | placeholder | spec ("," spec)*
+    spec         := "role:" name | wildcard | exact-id-or-substring
+    placeholder  := "" | "auto" | "default"        (gateway auto-picks)
+    wildcard     := contains "*", e.g. "*coder*", "qwen*"
+
+Rules:
+
+- `role:coder`, `role:reasoner`, `role:fast`, `role:vision`, `role:default`
+  are the standard roles. The operator's roles file defines the mapping.
+- Comma lists are priority fallbacks: `"role:coder,qwen*,gemma"` — first
+  spec that matches a model wins.
+- Matching is case-insensitive, exact id first, then substring.
+- The gateway may run a strict loaded-models policy: only models already
+  loaded are eligible, and a miss returns an error mentioning
+  `STRICT_LOADED_MODELS` instead of silently loading something. Handle
+  that error by retrying with `"auto"` or a different role.
+- The response's top-level `model` field is always the concrete id that
+  answered. The `X-Model-Resolution` / `X-Model-Routed-To` response
+  headers explain non-obvious routing when present.
+
+## Discover what is available (do this first)
+
+    GET /v1/models           -> {"data": [{"id": "...", ...}, ...]}
+    GET /swarm/models        -> {"models": [...], "roles": {...}, ...}
+    GET /healthz             -> rich gateway state (LM Studio gateway):
+                                loaded models, strict policy, swarm config
+
+Prefer `role:*` specs over ids from `/v1/models`; ids change between
+machines, roles do not.
+
+## Chat completions
+
+`POST /v1/chat/completions` — standard OpenAI shape, including
+`stream: true` (SSE with `data: ... [DONE]`).
+
+IMPORTANT for reasoning models: many local models emit hidden
+`reasoning_content` before the visible answer and can consume the entire
+token budget thinking. If you get a 200 with empty `content` and
+`finish_reason: "length"`, retry with `max_tokens >= 2000`. Defaulting
+`max_tokens` to 2000+ on this gateway is the safe choice.
+
+## Multi-model swarm endpoints
+
+Get N opinions, a judged vote, or a sequential chain in one HTTP call.
+In all bodies, `"models"` accepts a list of specs (roles/ids/wildcards)
+or the sentinel `"auto"` = every currently loaded chat-capable model.
+
+POST /swarm/fanout — same prompt to N models in parallel, returns all:
+
+    {"models": "auto", "messages": [...], "max_tokens": 2000}
+    -> {"object": "swarm.fanout", "responses": [
+         {"model": "...", "ok": true, "text": "...", "latency_ms": 1234, ...}, ...]}
+
+POST /swarm/vote — fanout then pick a winner; returns an OpenAI
+chat.completion whose content is the winning answer:
+
+    {"models": "auto", "messages": [...],
+     "strategy": "best-of-n",        # or "first-success" | "longest"
+     "judge": "role:reasoner",       # only for best-of-n
+     "max_tokens": 2000}
+    -> standard chat.completion + {"swarm": {"strategy": "...",
+         "winner": "<model-id>", "rationale": "...", "candidates": [...]}}
+
+POST /swarm/pipeline — sequential steps; later steps see earlier output
+via `{{step_name}}` / `{{previous}}` templates; returns the final step as
+a chat.completion (plus `swarm.history`):
+
+    {"messages": [...],
+     "steps": [
+       {"name": "plan",   "model": "role:reasoner", "system": "Plan it.", "max_tokens": 512},
+       {"name": "code",   "model": "role:coder",    "system": "Implement:\n{{plan}}"},
+       {"name": "review", "model": "role:reasoner", "system": "Critique:\n{{code}}"}]}
+
+POST /swarm/debate (MLX gateway only) — N models argue for `rounds`
+rounds, judge synthesizes:
+
+    {"models": "auto", "messages": [...], "rounds": 2, "judge": "role:reasoner"}
+
+Swarm via plain chat (no new endpoint needed): send a normal
+`/v1/chat/completions` request with `model: "swarmCouncil"` (vote) or
+`model: "swarm/fanout"`. Optional tuning via a `"swarm"` body key:
+
+    {"model": "swarmCouncil",
+     "messages": [...],
+     "swarm": {"models": "auto", "strategy": "first-success", "max_parallel": 2}}
+
+This path supports `stream: true`; dedicated `/swarm/*` endpoints do not.
+
+## Error contract
+
+- 400 — malformed request (missing messages/models, pipeline-on-chat).
+- 401 — missing/wrong API key.
+- 502 with `{"error": "...", "error_details": {"kinds": {...}, ...}}` —
+  all swarm agents failed; `error_details.kinds` maps error kinds
+  (e.g. `oom`, `timeout`, `empty_response`, `connection`) to counts.
+  `empty_response` means raise `max_tokens` and retry.
+- 503 — upstream unreachable, no models loaded, or admission queue full;
+  honor `Retry-After` when present.
+- Resolver miss (strict mode) — error text contains `STRICT_LOADED_MODELS`
+  and the loaded set; pick from that set or send `"auto"`.
+
+## Rules of thumb
+
+1. Never hardcode model ids. Use `role:*`, `"auto"`, or priority lists.
+2. Probe `/v1/models` (or `/healthz`) once at startup, not per call.
+3. Default `max_tokens` to 2000+; local reasoning models think first.
+4. Read `resp.model` to learn what actually answered; log it.
+5. Need a second opinion? One POST to `/swarm/vote` beats writing your
+   own orchestration loop.
+6. Same code works on both gateways; only the port differs.
