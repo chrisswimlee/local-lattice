@@ -21,6 +21,10 @@ Worked examples:
 - [LangGraph](./langgraph.md)
 - [OpenAI Agents SDK](./openai-agents-sdk.md)
 
+If the integrator is itself an AI agent, hand it [`llms.txt`](../../llms.txt)
+at the repo root — a self-contained, machine-oriented version of this
+documentation with exact request/response shapes for every endpoint.
+
 The same pattern works for CrewAI, Pydantic AI, Mastra, Aider, Cline,
 Continue.dev, and anything else that accepts a custom OpenAI base URL.
 Contributions of additional worked examples are welcome — see

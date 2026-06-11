@@ -6,6 +6,7 @@
 describe what they need; Lattice picks the right model, routes, swarms, and
 falls back. One OpenAI-compatible API, local-first.**
 
+[![CI](https://github.com/chrisswimlee/local-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisswimlee/local-lattice/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Project status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status-and-roadmap)
@@ -96,6 +97,21 @@ curl -sS http://127.0.0.1:5001/v1/chat/completions \
 The dashboard is at `http://127.0.0.1:5001/dashboard/` (set the same API
 key in its sessionStorage prompt). Disable it with
 `MLX_DASHBOARD_ENABLED=0`.
+
+### 60-second demo
+
+With either gateway running, [`scripts/demo.sh`](./scripts/demo.sh) walks
+the whole pitch against your live model set:
+
+```bash
+./scripts/demo.sh                            # LM Studio gateway on :5000
+BASE_URL=http://127.0.0.1:5001 ./scripts/demo.sh   # MLX gateway
+```
+
+It lists models, sends the same agent code at `role:fast` and
+`role:coder` (watch them resolve to *different* loaded models), then asks
+`/swarm/vote` for a judged second opinion. Swap what's loaded and run it
+again — the calls don't change.
 
 ## Which gateway should I run?
 
@@ -208,7 +224,7 @@ pip install -r requirements-mlx-gateway.txt   # == pip install -e .[mlx,anthropi
 ```
 
 Both files print a deprecation note in their comments. They will be
-removed in 0.2.0.
+removed in 0.3.0.
 
 ## Configuration
 
@@ -234,7 +250,7 @@ Quick reference of the most common knobs:
 | `DEFAULT_MODEL`             | _(empty)_   | Alias returned for `model: ""`/`auto`/`default`.        |
 | `MAX_CONCURRENT_MODELS`     | `2`         | LRU bound on resident MLX models.                       |
 | `MAX_PARALLEL_MODEL_CALLS`  | `2`         | Global concurrent-generation cap.                       |
-| `MLX_PER_MODEL_INFLIGHT_CAP`| `1`         | Per-alias generation cap (MLX gateway). `0` disables admission (legacy; emits `DeprecationWarning` when unset before 0.2.0). |
+| `MLX_PER_MODEL_INFLIGHT_CAP`| `1`         | Per-alias generation cap (MLX gateway). `0` disables admission (legacy; emits `DeprecationWarning` when unset before 0.3.0). |
 | `MLX_FORCE_GC_ON_EVICT`     | `0`         | When `1`, run `gc.collect()` after every MLX eviction in addition to the Metal-cache release. Tighter peak RSS on memory-tight Macs at the cost of small extra wall-clock latency per swap. |
 | `EXTRA_PLACEHOLDER_MODELS`  | _(unset → legacy OpenClaw set + `DeprecationWarning`)_ | Comma-separated extra "you pick" aliases; set to empty to exclude legacy ids. |
 | `PREFER_LOADED_MODELS`      | `strict`    | LM Studio gateway loaded-id policy. `strict` never JIT-loads installed-but-not-loaded ids; `1` falls back to the installed set on a miss; `0` ignores loaded vs installed. Unset emits a `DeprecationWarning` (legacy default was `1`). |
@@ -242,7 +258,7 @@ Quick reference of the most common knobs:
 | `SWARM_CHAT_AUTO_MAX`       | `3`         | Cap on how many loaded ids the `auto` sentinel contributes to a default-shaped swarm. Keeps fanout-vs-latency reasonable on boxes with many loaded models. Set to `0` to disable the cap. Dedicated `/swarm/fanout` HTTP endpoint ignores this. |
 | `SWARM_CHAT_DEFAULT_STRATEGY` | `best-of-n` | Default swarm winner-pick when the request omits `swarm.strategy`. `best-of-n` (judge picks from candidates), `first-success` (returns on first temporally successful agent, cancels pending peers), `longest`, `fanout`. |
 | `ANTHROPIC_API_KEY`         | _(unset)_   | Enables optional Claude escalation for long tasks.      |
-| `ANTHROPIC_AUTO_ROUTE`      | `1`         | Auto-escalate big tasks. Will default off in 0.2.0.     |
+| `ANTHROPIC_AUTO_ROUTE`      | `1`         | Auto-escalate big tasks. Will default off in 0.3.0.     |
 | `MLX_DASHBOARD_ENABLED`     | `1`         | Mount the in-process dashboard at `/dashboard/`.        |
 | `MLX_DASHBOARD_CAPTURE_PROMPTS` | `0`     | Keep prompts in the dashboard ring. Off by default.     |
 
@@ -283,6 +299,10 @@ A full threat model and the responsible-disclosure address live in
 
 ## Docs
 
+- [`llms.txt`](./llms.txt) — **self-contained integration guide for AI
+  agents**: feed this one file to a coding agent and it has every
+  endpoint shape, the `model` grammar, and the error contract needed to
+  integrate without human help.
 - [`docs/why-lattice.md`](./docs/why-lattice.md) — the longer "why this
   exists" story: capability routing as an agent-infra primitive.
 - [`docs/capabilities.md`](./docs/capabilities.md) — formal spec of the
