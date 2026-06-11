@@ -1,17 +1,13 @@
 import os
 import sys
-import json
-import time
 import warnings
-import requests
-import re
-import uuid
-from flask import Flask, request, Response, stream_with_context
 
+from flask import Flask, Response, stream_with_context
+
+from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError
 from middle_layer.security import apply_security_headers as _apply_security_headers
 from middle_layer.security import check_api_key as _check_api_key
 from middle_layer.security import enforce_safe_bind as _enforce_safe_bind
-from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError
 from middle_layer.security import resolve_max_request_bytes as _resolve_max_request_bytes
 
 app = Flask(__name__)
@@ -66,8 +62,10 @@ CACHE_TTL_SECONDS = 60
 # of ``mod.get_lmstudio_model_ids`` et al. keeps working.
 MODEL_LIST_TTL = int(os.environ.get("MODEL_LIST_TTL", "30"))
 
-from middle_layer.lmstudio_client import LMStudioClient  # noqa: E402
-from middle_layer.lmstudio_client import is_chat_capable_model_id  # noqa: E402, F401
+from middle_layer.lmstudio_client import (
+    LMStudioClient,  # noqa: E402
+    is_chat_capable_model_id,  # noqa: E402, F401
+)
 
 _LMSTUDIO = LMStudioClient(LM_STUDIO_URL, model_list_ttl=MODEL_LIST_TTL)
 
@@ -192,6 +190,13 @@ MODEL_ROLES, MODEL_ROLES_SOURCE = _load_model_roles()
 # names that pre-Pass-3 callers (and tests) referenced at module level so
 # this is a pure relocation, not a behavior change. New code should import
 # from ``middle_layer.swarm`` directly.
+from middle_layer.cloud_escalation import (  # noqa: E402
+    BigTaskThresholds,
+    CloudEscalationClient,
+)
+from middle_layer.cloud_escalation import (
+    extract_user_intent_text as _extract_user_intent_text_impl,
+)
 from middle_layer.swarm import (  # noqa: E402, F401
     # F401 is global to this block on purpose: every name here is a
     # back-compat re-export for pre-Pass-3 callers that historically
@@ -209,48 +214,77 @@ from middle_layer.swarm import (  # noqa: E402, F401
     _per_model_semaphores,
 )
 
+_CLOUD = CloudEscalationClient(
+    anthropic_api_key=ANTHROPIC_API_KEY,
+    anthropic_base_url=ANTHROPIC_BASE_URL,
+    anthropic_model=ANTHROPIC_MODEL,
+    anthropic_version=ANTHROPIC_VERSION,
+    use_litellm_for_anthropic=USE_LITELLM_FOR_ANTHROPIC,
+    litellm_timeout_seconds=LITELLM_TIMEOUT_SECONDS,
+    big_task=BigTaskThresholds(
+        min_words=BIG_TASK_MIN_WORDS,
+        min_chars=BIG_TASK_MIN_CHARS,
+        min_bullets=BIG_TASK_MIN_BULLETS,
+        min_step_markers=BIG_TASK_MIN_STEP_MARKERS,
+    ),
+    litellm_completion=litellm_completion,
+    litellm_import_error=_litellm_import_error,
+    default_chat_timeout=SWARM_PER_CALL_TIMEOUT,
+)
+
 
 def _litellm_available() -> bool:
-    return litellm_completion is not None
+    return _CLOUD.litellm_available()
 
 
 def _litellm_model_for_anthropic(model_name: str) -> str:
-    name = (model_name or "").strip()
-    if "/" in name:
-        return name
-    return f"anthropic/{name}"
+    from middle_layer.cloud_escalation import litellm_model_for_anthropic
+
+    return litellm_model_for_anthropic(model_name)
 
 
 def _litellm_response_to_dict(resp):
-    if isinstance(resp, dict):
-        return resp
-    if hasattr(resp, "model_dump"):
-        return resp.model_dump()
-    if hasattr(resp, "dict"):
-        return resp.dict()
-    # Best effort fallback for unexpected response objects.
-    return json.loads(json.dumps(resp, default=str))
+    from middle_layer.cloud_escalation import litellm_response_to_dict
+
+    return litellm_response_to_dict(resp)
 
 
 def _call_litellm_chat(messages, model_override=None, **kwargs):
-    """Call LiteLLM chat completion and return OpenAI-shaped JSON."""
-    if not _litellm_available():
-        return None, f"LiteLLM not available: {_litellm_import_error or 'import failed'}"
+    return _CLOUD.call_litellm_chat(messages, model_override=model_override, **kwargs)
 
-    payload = {
-        "model": model_override,
-        "messages": messages or [],
-        "stream": False,
-    }
-    for k in ("max_tokens", "temperature", "top_p", "stop"):
-        if kwargs.get(k) is not None:
-            payload[k] = kwargs[k]
 
-    try:
-        resp = litellm_completion(**payload, timeout=kwargs.get("timeout", LITELLM_TIMEOUT_SECONDS))
-        return _litellm_response_to_dict(resp), None
-    except Exception as e:  # noqa: BLE001
-        return None, f"LiteLLM error: {e}"
+def _should_route_to_anthropic(endpoint: str, json_data: dict) -> bool:
+    return _CLOUD.should_route_to_anthropic(endpoint, json_data)
+
+
+def _extract_user_intent_text(json_data: dict) -> str:
+    return _extract_user_intent_text_impl(json_data)
+
+
+def _openai_messages_to_anthropic(json_data: dict) -> dict:
+    from middle_layer.cloud_escalation import openai_messages_to_anthropic
+
+    return openai_messages_to_anthropic(json_data, default_model=ANTHROPIC_MODEL)
+
+
+def _anthropic_to_openai_chat_completion(anthropic_json: dict) -> dict:
+    from middle_layer.cloud_escalation import anthropic_to_openai_chat_completion
+
+    return anthropic_to_openai_chat_completion(
+        anthropic_json, anthropic_model=ANTHROPIC_MODEL
+    )
+
+
+def _looks_like_code(text_lower: str) -> bool:
+    from middle_layer.cloud_escalation import looks_like_code
+
+    return looks_like_code(text_lower)
+
+
+def _is_big_task(text: str) -> bool:
+    from middle_layer.cloud_escalation import is_big_task
+
+    return is_big_task(text, thresholds=_CLOUD.big_task)
 
 
 def get_lmstudio_model_ids(force_refresh: bool = False):
@@ -378,512 +412,6 @@ def resolve_model_id(requested, available=None, loaded=None):
     return _resolver.resolve_model_id(requested, available, loaded, policy=_resolver_policy())
 
 
-def _looks_like_code(text_lower: str) -> bool:
-    return bool(
-        re.search(r"[{};()\[\]]", text_lower)
-        or re.search(r"\b(def|class|function|var|let|const|import|from|#include|traceback|stack trace)\b", text_lower)
-        or "```" in text_lower
-    )
-
-
-def _is_big_task(text: str) -> bool:
-    t = (text or "").strip()
-    tl = t.lower()
-
-    words = re.findall(r"\w+", t)
-    word_count = len(words)
-    char_count = len(t)
-    bullet_count = len(re.findall(r"^\s*([-*]|\d+\.)\s+", t, flags=re.MULTILINE))
-
-    step_markers = [
-        "step ", "steps", "phase", "phases", "roadmap", "milestone",
-        "end-to-end", "from scratch", "system design", "architecture",
-        "tradeoff", "trade-offs", "pros and cons", "migration plan",
-        "rollout", "roll-out", "risk", "risks",
-    ]
-    step_score = sum(1 for m in step_markers if m in tl)
-
-    # Long/multi-step requests are "big".
-    if word_count >= BIG_TASK_MIN_WORDS or char_count >= BIG_TASK_MIN_CHARS:
-        return True
-    if bullet_count >= BIG_TASK_MIN_BULLETS:
-        return True
-    if step_score >= BIG_TASK_MIN_STEP_MARKERS:
-        return True
-
-    return False
-
-
-def _extract_user_intent_text(json_data: dict) -> str:
-    """
-    Best-effort extraction of "what the user asked" from OpenAI-like payloads.
-    Works for chat.completions and falls back gracefully.
-    """
-    parts = []
-
-    messages = json_data.get("messages")
-    if isinstance(messages, list):
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role")
-            content = m.get("content")
-            if role in ("user", "system") and content:
-                if isinstance(content, str):
-                    parts.append(content)
-                elif isinstance(content, list):
-                    # OpenAI "content parts" shape
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
-                            parts.append(p["text"])
-
-    prompt = json_data.get("prompt")
-    if isinstance(prompt, str):
-        parts.append(prompt)
-
-    return "\n".join(parts).strip()
-
-
-def _should_route_to_anthropic(endpoint: str, json_data: dict) -> bool:
-    # Only route chat-completions-like calls.
-    if endpoint not in ("chat/completions",):
-        return False
-    if not ANTHROPIC_API_KEY:
-        return False
-
-    text = _extract_user_intent_text(json_data)
-    if not text:
-        return False
-
-    # Code/debug should stay local by default.
-    if _looks_like_code(text.lower()):
-        return False
-
-    return _is_big_task(text)
-
-
-def _openai_messages_to_anthropic(json_data: dict) -> dict:
-    messages_in = json_data.get("messages", [])
-    system_chunks = []
-    out_messages = []
-
-    if isinstance(messages_in, list):
-        for m in messages_in:
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role")
-            content = m.get("content")
-
-            # Normalize OpenAI content to text.
-            text = ""
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                texts = []
-                for p in content:
-                    if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
-                        texts.append(p["text"])
-                text = "\n".join(texts).strip()
-
-            if not text:
-                continue
-
-            if role == "system":
-                system_chunks.append(text)
-                continue
-            if role in ("user", "assistant"):
-                out_messages.append(
-                    {
-                        "role": role,
-                        "content": [{"type": "text", "text": text}],
-                    }
-                )
-
-    system_text = "\n".join(system_chunks).strip() if system_chunks else None
-
-    max_tokens = json_data.get("max_tokens")
-    if not isinstance(max_tokens, int):
-        # OpenAI "max_tokens" may be absent; set a sane default for Anthropic.
-        max_tokens = 1024
-
-    temperature = json_data.get("temperature")
-    if temperature is not None and not isinstance(temperature, (int, float)):
-        temperature = None
-
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": max_tokens,
-        "messages": out_messages,
-    }
-    if system_text:
-        payload["system"] = system_text
-    if temperature is not None:
-        payload["temperature"] = temperature
-
-    # NOTE: Tools/function-calling is not mapped here yet.
-    return payload
-
-
-def _anthropic_to_openai_chat_completion(anthropic_json: dict) -> dict:
-    # Extract assistant text.
-    text_parts = []
-    content = anthropic_json.get("content")
-    if isinstance(content, list):
-        for p in content:
-            if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
-                text_parts.append(p["text"])
-    assistant_text = "".join(text_parts)
-
-    now = int(time.time())
-    resp = {
-        "id": f"chatcmpl_{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": now,
-        "model": f"anthropic/{ANTHROPIC_MODEL}",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": assistant_text},
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
-    usage = anthropic_json.get("usage")
-    if isinstance(usage, dict):
-        # Anthropic: {input_tokens, output_tokens}
-        it = usage.get("input_tokens")
-        ot = usage.get("output_tokens")
-        if isinstance(it, int) and isinstance(ot, int):
-            resp["usage"] = {"prompt_tokens": it, "completion_tokens": ot, "total_tokens": it + ot}
-
-    return resp
-
-
-def _filtered_forward_headers():
-    # Drop hop-by-hop headers and headers that are likely to be wrong if we mutate the body.
-    excluded = {"host", "content-length", "connection", "transfer-encoding"}
-    return {k: v for k, v in request.headers if k.lower() not in excluded}
-
-
-def _build_flask_response(upstream_resp: requests.Response):
-    excluded_headers = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
-    proxy_headers = [(name, value) for (name, value) in upstream_resp.headers.items()
-                    if name.lower() not in excluded_headers]
-
-    def generate():
-        for chunk in upstream_resp.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
-
-    return Response(generate(), status=upstream_resp.status_code, headers=proxy_headers)
-
-
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    # Basic readiness: can we reach LM Studio and is at least one model loaded?
-    ids, err = get_lmstudio_model_ids(force_refresh=True)
-    loaded, lerr = get_loaded_lmstudio_model_ids(force_refresh=True)
-    status = 200 if ids and not err else 503
-    return Response(
-        json.dumps(
-            {
-                "ok": status == 200,
-                "lmstudio_model": ids[0] if ids else None,
-                "lmstudio_models": ids,
-                "lmstudio_loaded_models": loaded,
-                "lmstudio_loaded_endpoint_supported": _LMSTUDIO.loaded_endpoint_supported,
-                "lmstudio_loaded_error": lerr,
-                "lmstudio_error": err,
-                "model_roles": MODEL_ROLES,
-                "model_roles_source": MODEL_ROLES_SOURCE,
-                "prefer_loaded_models": bool(PREFER_LOADED_MODELS),
-                "strict_loaded_models": bool(STRICT_LOADED_MODELS),
-                "default_model": DEFAULT_MODEL or None,
-                "max_parallel": MAX_PARALLEL_MODEL_CALLS,
-                "per_model_inflight_cap": LM_STUDIO_PER_MODEL_INFLIGHT_CAP,
-                "on_model_miss": ON_MODEL_MISS,
-                "anthropic_enabled": bool(ANTHROPIC_API_KEY),
-                "anthropic_model": ANTHROPIC_MODEL,
-                "litellm_available": _litellm_available(),
-                "litellm_for_anthropic": bool(USE_LITELLM_FOR_ANTHROPIC),
-                "litellm_prefix_routing": bool(ENABLE_LITELLM_PREFIX_ROUTING),
-                "litellm_import_error": None if _litellm_available() else _litellm_import_error,
-                "swarm_chat_enabled": bool(SWARM_CHAT_ENABLED),
-                "swarm_chat_default_models": SWARM_CHAT_DEFAULT_MODELS,
-                "swarm_chat_default_strategy": SWARM_CHAT_DEFAULT_STRATEGY,
-                "swarm_chat_auto_tokens": sorted(_SWARM_AUTO_TOKENS),
-                "swarm_chat_canonical": _SWARM_CHAT_CANONICAL,
-                "swarm_chat_aliases": {
-                    name: {"intent": intent, "deprecated": deprecated}
-                    for name, (intent, deprecated) in sorted(_SWARM_CHAT_INTENTS.items())
-                },
-            }
-        ),
-        status=status,
-        mimetype="application/json",
-    )
-
-@app.before_request
-def _auth_guard():
-    if not MIDDLE_LAYER_API_KEY:
-        return None
-    if _check_api_key(request.headers, MIDDLE_LAYER_API_KEY):
-        return None
-    return Response(
-        json.dumps({"error": "Unauthorized"}),
-        status=401,
-        mimetype="application/json",
-    )
-
-
-@app.after_request
-def _security_headers(response):
-    _apply_security_headers(response, path=request.path or "")
-    return response
-
-
-@app.route('/v1/<path:endpoint>', methods=['POST', 'GET'])
-def proxy(endpoint):
-    """OpenAI-compatible front door: local-first, Opus for big tasks."""
-    
-    # For GET requests (like /models), forward directly without modification
-    if request.method == 'GET':
-        resp = requests.request(
-            method=request.method,
-            url=f'{LM_STUDIO_URL}/v1/{endpoint}',
-            headers=_filtered_forward_headers(),
-            data=None,
-            cookies=request.cookies,
-            allow_redirects=False,
-            stream=True,
-        )
-
-        return _build_flask_response(resp)
-    
-    # For POST requests, decide local vs Anthropic (only for chat/completions).
-    headers = _filtered_forward_headers()
-    data = request.get_data()
-    
-    if request.is_json:
-        try:
-            json_data = json.loads(data)
-
-            # If this is a big task and Anthropic is configured, route to Opus.
-            if _should_route_to_anthropic(endpoint, json_data):
-                if json_data.get("stream") is True:
-                    return Response(
-                        json.dumps(
-                            {
-                                "error": "Streaming via Anthropic routing is not enabled in middle_layer.py yet. Set stream=false or route locally."
-                            }
-                        ),
-                        status=501,
-                        mimetype="application/json",
-                    )
-
-                llm_resp, llm_err = _call_anthropic_chat(
-                    json_data.get("messages") or [],
-                    max_tokens=json_data.get("max_tokens"),
-                    temperature=json_data.get("temperature"),
-                    top_p=json_data.get("top_p"),
-                    stop=json_data.get("stop"),
-                    timeout=60,
-                )
-                if llm_err or not llm_resp:
-                    return Response(
-                        json.dumps({"error": f"Anthropic routing failed: {llm_err}"}),
-                        status=502,
-                        mimetype="application/json",
-                    )
-
-                openai_like = llm_resp
-                # Help clients see which backend was used.
-                resp_headers = {"X-Model-Routed-To": f"anthropic/{ANTHROPIC_MODEL}"}
-                return Response(json.dumps(openai_like), status=200, mimetype="application/json", headers=resp_headers)
-
-            requested = json_data.get("model")
-            if (
-                endpoint == "chat/completions"
-                and ENABLE_LITELLM_PREFIX_ROUTING
-                and isinstance(requested, str)
-                and requested.lower().startswith("litellm/")
-            ):
-                if json_data.get("stream") is True:
-                    return Response(
-                        json.dumps(
-                            {
-                                "error": "Streaming via litellm/ routing is not enabled in middle_layer.py yet. Set stream=false."
-                            }
-                        ),
-                        status=501,
-                        mimetype="application/json",
-                    )
-                routed_model = requested.split("/", 1)[1].strip()
-                llm_resp, llm_err = _call_litellm_chat(
-                    json_data.get("messages") or [],
-                    model_override=routed_model,
-                    max_tokens=json_data.get("max_tokens"),
-                    temperature=json_data.get("temperature"),
-                    top_p=json_data.get("top_p"),
-                    stop=json_data.get("stop"),
-                    timeout=60,
-                )
-                if llm_err or not llm_resp:
-                    return Response(
-                        json.dumps({"error": f"LiteLLM routing failed: {llm_err}"}),
-                        status=502,
-                        mimetype="application/json",
-                    )
-                return Response(
-                    json.dumps(llm_resp),
-                    status=200,
-                    mimetype="application/json",
-                    headers={"X-Model-Routed-To": f"litellm/{routed_model}"},
-                )
-
-            swarm_intent, swarm_canonical = (None, None)
-            if endpoint == "chat/completions" and SWARM_CHAT_ENABLED:
-                swarm_intent, swarm_canonical = _swarm_chat_intent(requested)
-
-            if swarm_intent is not None:
-                # ``pipeline`` is intentionally a 400 (not 502) — it's a
-                # client misuse, not an upstream failure.
-                if swarm_intent == "pipeline":
-                    body, err, _ = _run_swarm_chat_completion(
-                        requested, json_data, intent="pipeline"
-                    )
-                    return Response(
-                        json.dumps({
-                            "error": err,
-                            "redirect": "POST /swarm/pipeline",
-                        }),
-                        status=400,
-                        mimetype="application/json",
-                    )
-
-                wants_stream = json_data.get("stream") is True
-                swarm_resp, swarm_err, swarm_err_details = _run_swarm_chat_completion(
-                    requested, json_data, intent=swarm_intent
-                )
-                if swarm_err or not swarm_resp:
-                    body: dict = {"error": f"Swarm routing failed: {swarm_err}"}
-                    if swarm_err_details:
-                        # Structured per-agent breakdown so callers can dispatch
-                        # on error_kind without parsing the prose summary.
-                        body["error_details"] = swarm_err_details
-                    headers: dict = {}
-                    if swarm_canonical and swarm_canonical.lower() != requested.strip().lower():
-                        # Help the client move off a deprecated alias even on
-                        # the failure path.
-                        headers["X-Swarm-Canonical-Name"] = swarm_canonical
-                    if isinstance(swarm_err_details, dict):
-                        kinds = swarm_err_details.get("kinds") or {}
-                        if kinds:
-                            headers["X-Swarm-Error-Kinds"] = ",".join(
-                                f"{k}={v}" for k, v in sorted(kinds.items())
-                            )
-                    return Response(
-                        json.dumps(body),
-                        status=502,
-                        mimetype="application/json",
-                        headers=headers or None,
-                    )
-                if wants_stream:
-                    return _swarm_body_to_sse_response(swarm_resp)
-                resp_headers = {
-                    "X-Model-Routed-To": str(swarm_resp.get("model", "swarm/unknown")),
-                    "X-Swarm-Intent": swarm_intent,
-                }
-                if swarm_canonical and swarm_canonical.lower() != requested.strip().lower():
-                    resp_headers["X-Swarm-Canonical-Name"] = swarm_canonical
-                return Response(
-                    json.dumps(swarm_resp),
-                    status=200,
-                    mimetype="application/json",
-                    headers=resp_headers,
-                )
-            
-            # Resolve the requested model against what is actually loaded.
-            model_id, error = resolve_model_id(requested)
-            fallback_from = None
-
-            if error or not model_id:
-                # If the caller asked for a specific model that is not loaded,
-                # either fall back (default) or surface the error.
-                if not _is_placeholder(requested) and ON_MODEL_MISS == "fallback":
-                    # Under STRICT_LOADED_MODELS, fall back only to a loaded
-                    # id so the proxy never silently asks LM Studio to JIT a
-                    # different installed model.
-                    if STRICT_LOADED_MODELS:
-                        fb_ids, fb_err = get_loaded_lmstudio_model_ids()
-                    else:
-                        fb_ids, fb_err = get_lmstudio_model_ids()
-                    if not fb_err and fb_ids:
-                        model_id = fb_ids[0]
-                        fallback_from = requested
-                        error = None
-                if error or not model_id:
-                    return Response(
-                        json.dumps({"error": f"503 Service Unavailable - {error}"}),
-                        status=503,
-                        mimetype='application/json'
-                    )
-
-            # Inject the resolved model ID (LM Studio needs an exact id).
-            json_data['model'] = model_id
-
-            # Forward to LM Studio with injected model
-            resp = requests.request(
-                method=request.method,
-                url=f'{LM_STUDIO_URL}/v1/{endpoint}',
-                headers=headers,
-                data=json.dumps(json_data).encode('utf-8'),
-                cookies=request.cookies,
-                allow_redirects=False,
-                stream=True,
-                timeout=300,
-            )
-
-            flask_resp = _build_flask_response(resp)
-            flask_resp.headers["X-Model-Routed-To"] = f"local/{model_id}"
-            if fallback_from:
-                flask_resp.headers["X-Model-Resolution"] = (
-                    f"fallback (requested '{fallback_from}', not loaded)"
-                )
-            return flask_resp
-        
-        except Exception as e:
-            # If JSON parsing fails, forward as-is
-            resp = requests.request(
-                method=request.method,
-                url=f'{LM_STUDIO_URL}/v1/{endpoint}',
-                headers=headers,
-                data=data,
-                cookies=request.cookies,
-                allow_redirects=False,
-                stream=True,
-                timeout=300,
-            )
-
-            return _build_flask_response(resp)
-    
-    else:
-        # Non-JSON request - forward as-is
-        resp = requests.request(
-            method=request.method,
-            url=f'{LM_STUDIO_URL}/v1/{endpoint}',
-            headers=headers,
-            data=data,
-            cookies=request.cookies,
-            allow_redirects=False,
-            stream=True,
-            timeout=300,
-        )
-
-        return _build_flask_response(resp)
-
-
 # ===========================================================================
 # SWARM / MULTI-AGENT
 # ---------------------------------------------------------------------------
@@ -917,64 +445,27 @@ def _lmstudio_chat_completion(model_id, messages, **kwargs):
 
 
 def _call_anthropic_chat(messages, model_override=None, **kwargs):
-    """Call Anthropic /v1/messages with OpenAI-shaped messages and translate
-    the response back into an OpenAI chat completion. Returns (resp, error)."""
-    if USE_LITELLM_FOR_ANTHROPIC and _litellm_available():
-        model_name = _litellm_model_for_anthropic(model_override or ANTHROPIC_MODEL)
-        return _call_litellm_chat(messages, model_override=model_name, **kwargs)
-
-    if not ANTHROPIC_API_KEY:
-        return None, "ANTHROPIC_API_KEY not set"
-
-    pseudo = {"messages": messages}
-    if kwargs.get("max_tokens") is not None:
-        pseudo["max_tokens"] = kwargs["max_tokens"]
-    if kwargs.get("temperature") is not None:
-        pseudo["temperature"] = kwargs["temperature"]
-
-    payload = _openai_messages_to_anthropic(pseudo)
-    if model_override:
-        payload["model"] = model_override
-
-    try:
-        r = requests.post(
-            f"{ANTHROPIC_BASE_URL}/v1/messages",
-            headers={
-                "content-type": "application/json",
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": ANTHROPIC_VERSION,
-            },
-            data=json.dumps(payload).encode("utf-8"),
-            timeout=kwargs.get("timeout", SWARM_PER_CALL_TIMEOUT),
-        )
-        if r.status_code >= 400:
-            return None, f"Anthropic {r.status_code}: {r.text[:300]}"
-        return _anthropic_to_openai_chat_completion(r.json()), None
-    except Exception as e:
-        return None, f"Anthropic error: {e}"
+    """Call Anthropic / LiteLLM and return an OpenAI-shaped chat completion."""
+    return _CLOUD.call_anthropic_chat(messages, model_override=model_override, **kwargs)
 
 
 # Pure swarm helpers re-exported here so historical call sites (and tests
 # that monkey-patch ``mod._classify_swarm_error`` etc.) keep working without
 # updating to the new module path. New code should import from
 # ``middle_layer.swarm`` directly.
-from middle_layer.swarm import (  # noqa: E402, F401
+from middle_layer.swarm import (  # noqa: E402, F401  # noqa: E402, F401
+    # Back-compat re-exports — see the block above.
+    _SWARM_AUTO_TOKENS,
     _SWARM_ERROR_KINDS,
     _classify_swarm_error,
     _extract_text,
     _extract_upstream_status,
+    _is_auto_swarm_token,
     _normalize_agent_spec,
     _strip_upstream_prefix,
 )
-
-
-from middle_layer.swarm import (  # noqa: E402, F401
-    # Back-compat re-exports — see the block above.
-    _SWARM_AUTO_TOKENS,
-    _is_auto_swarm_token,
-)
-from middle_layer.swarm import expand_swarm_models as _swarm_expand_models  # noqa: E402
 from middle_layer.swarm import SWARM_CHAT_AUTO_MAX as _SWARM_CHAT_AUTO_MAX  # noqa: E402
+from middle_layer.swarm import expand_swarm_models as _swarm_expand_models  # noqa: E402
 
 
 def _swarm_auto_pool():
@@ -1011,6 +502,7 @@ def _expand_swarm_models(spec, available=None, *, apply_auto_cap: bool = False):
     )
 
 
+from middle_layer import swarm as _swarm_runner  # noqa: E402
 from middle_layer.swarm import (  # noqa: E402, F401
     # Back-compat re-exports — see the block above.
     _SWARM_CHAT_CANONICAL,
@@ -1020,7 +512,6 @@ from middle_layer.swarm import (  # noqa: E402, F401
     _swarm_alias_warned,
     _swarm_chat_intent,
 )
-from middle_layer import swarm as _swarm_runner  # noqa: E402
 
 # Single ``SwarmDeps`` for this gateway. Built lazily so module-level globals
 # defined further down (``ANTHROPIC_MODEL``, etc.) are already in scope.
@@ -1090,328 +581,58 @@ def _swarm_body_to_sse_response(body: dict, *, chunk_chars: int = SWARM_STREAM_C
     )
 
 
-@app.route("/swarm/models", methods=["GET"])
-def swarm_models():
-    ids, err = get_lmstudio_model_ids(force_refresh=True)
-    return Response(
-        json.dumps(
-            {
-                "models": ids,
-                "roles": MODEL_ROLES,
-                "default_model": DEFAULT_MODEL or None,
-                "max_parallel": MAX_PARALLEL_MODEL_CALLS,
-                "anthropic_available": bool(ANTHROPIC_API_KEY),
-                "anthropic_model": ANTHROPIC_MODEL if ANTHROPIC_API_KEY else None,
-                "litellm_available": _litellm_available(),
-                "litellm_for_anthropic": bool(USE_LITELLM_FOR_ANTHROPIC),
-                "swarm_chat_auto_tokens": sorted(_SWARM_AUTO_TOKENS),
-                "error": err,
-            }
-        ),
-        status=200 if not err else 503,
-        mimetype="application/json",
-    )
+from middle_layer.lmstudio_routes import (  # noqa: E402
+    LmStudioRouteContext,
+    register_lmstudio_routes,
+)
 
-
-@app.route("/swarm/fanout", methods=["POST"])
-def swarm_fanout():
-    """Broadcast one prompt to N models in parallel. Returns every response.
-
-    Body:
-      {
-        "models":   ["role:coder", "qwen2.5-7b", "anthropic"],
-        "messages": [...],         # OpenAI shape
-        "max_tokens": 512,         # optional, applied to every agent
-        "temperature": 0.7,        # optional
-        "max_parallel": 3          # optional override (capped by env)
-      }
-
-    "models" also accepts the sentinel "auto" (or "loaded" / "*" / "all"),
-    either as a bare string or as one entry in the list. Sentinels expand
-    inline to every model currently loaded in LM Studio (de-duped, ordered).
-    """
-    data = request.get_json(silent=True) or {}
-    models = data.get("models") or []
-    messages = data.get("messages") or []
-    if not isinstance(models, (list, str)) or not models:
-        return Response(json.dumps({"error": "models (list, or 'auto') is required"}),
-                        status=400, mimetype="application/json")
-    if not isinstance(messages, list) or not messages:
-        return Response(json.dumps({"error": "messages (list) is required"}),
-                        status=400, mimetype="application/json")
-
-    models, exp_err = _expand_swarm_models(models)
-    if exp_err:
-        return Response(json.dumps({"error": exp_err}),
-                        status=503, mimetype="application/json")
-    if not models:
-        return Response(
-            json.dumps({"error": "no LM Studio models loaded; load at least one or pass explicit models"}),
-            status=503, mimetype="application/json",
-        )
-
-    common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
-    common = {k: v for k, v in common.items() if v is not None}
-
-    results, err = _fanout(
-        models, messages, common, max_parallel=data.get("max_parallel")
-    )
-    if err:
-        return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
-
-    return Response(
-        json.dumps(
-            {
-                "id": f"swarm_{uuid.uuid4().hex}",
-                "object": "swarm.fanout",
-                "created": int(time.time()),
-                "responses": results,
-            }
-        ),
-        status=200,
-        mimetype="application/json",
-        headers={"X-Swarm-Models": ",".join((r or {}).get("model", "?") for r in results)},
-    )
-
-
-@app.route("/swarm/vote", methods=["POST"])
-def swarm_vote():
-    """Fanout + consensus. Returns an OpenAI chat.completion with the winner.
-
-    Body:
-      {
-        "models":      [...],
-        "messages":    [...],
-        "strategy":    "best-of-n" | "first-success" | "longest",
-        "judge":       "role:reasoner",        # only for best-of-n
-        "judge_system": "You are a strict judge. ..."   # optional override
-      }
-    """
-    data = request.get_json(silent=True) or {}
-    models = data.get("models") or []
-    messages = data.get("messages") or []
-    strategy = (data.get("strategy") or "best-of-n").lower()
-
-    models_ok = isinstance(models, (list, str)) and models
-    if not models_ok or not isinstance(messages, list) or not messages:
-        return Response(json.dumps({"error": "models and messages are required"}),
-                        status=400, mimetype="application/json")
-
-    models, exp_err = _expand_swarm_models(models)
-    if exp_err:
-        return Response(json.dumps({"error": exp_err}),
-                        status=503, mimetype="application/json")
-    if not models:
-        return Response(
-            json.dumps({"error": "no LM Studio models loaded; load at least one or pass explicit models"}),
-            status=503, mimetype="application/json",
-        )
-
-    common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")
-              if data.get(k) is not None}
-
-    candidates, err = _fanout(models, messages, common)
-    if err:
-        return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
-
-    successes = [c for c in candidates if c["ok"] and c.get("text")]
-    if not successes:
-        errs = "; ".join(c.get("error") or "unknown" for c in candidates)
-        return Response(
-            json.dumps({"error": f"all agents failed: {errs}", "candidates": candidates}),
-            status=502, mimetype="application/json",
-        )
-
-    rationale = ""
-    if strategy == "first-success":
-        winner = successes[0]
-        rationale = "first agent to return a non-empty response"
-    elif strategy == "longest":
-        winner = max(successes, key=lambda c: len(c.get("text", "")))
-        rationale = "longest non-empty response"
-    else:  # best-of-n
-        labels = [chr(ord("A") + i) for i in range(len(successes))]
-        rendered = "\n\n".join(
-            f"[{labels[i]}] (model={successes[i]['model']})\n{successes[i]['text']}"
-            for i in range(len(successes))
-        )
-        original_user = _extract_user_intent_text({"messages": messages})
-        judge_system = data.get("judge_system") or (
-            "You are a strict judge. Below are candidate responses to a user request "
-            "from different models, labeled [A], [B], etc. Pick the single best one. "
-            "Reply with ONLY the letter on its own line, then a one-sentence reason."
-        )
-        judge_messages = [
-            {"role": "system", "content": judge_system},
-            {"role": "user", "content": (
-                f"Original request:\n{original_user}\n\n"
-                f"Candidate responses:\n{rendered}\n\n"
-                "Pick the best one (A, B, ...) and explain briefly."
-            )},
-        ]
-        judge_request = data.get("judge") or "role:reasoner"
-        avail, _ = get_lmstudio_model_ids()
-        judge_id, jerr = resolve_model_id(judge_request, avail)
-
-        if jerr or not judge_id:
-            winner = max(successes, key=lambda c: len(c.get("text", "")))
-            rationale = f"judge unavailable ({jerr or 'no model'}); picked longest"
-        else:
-            # See chat-route judge above — same per-model semaphore policy.
-            with _per_model_semaphore(judge_id):
-                jresp, jerr = _lmstudio_chat_completion(
-                    judge_id, judge_messages, max_tokens=200, temperature=0.0
-                )
-            verdict = _extract_text(jresp)
-            picked_idx = None
-            if verdict:
-                for i, lab in enumerate(labels):
-                    if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                        picked_idx = i
-                        break
-            if picked_idx is None:
-                winner = max(successes, key=lambda c: len(c.get("text", "")))
-                rationale = (
-                    f"judge response unparseable; fell back to longest. "
-                    f"Verdict: {verdict[:140]}"
-                )
-            else:
-                winner = successes[picked_idx]
-                rationale = verdict.strip()
-
-    out = {
-        "id": f"chatcmpl_{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": f"swarm/{winner['model']}",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": winner["text"]},
-            "finish_reason": "stop",
-        }],
-        "swarm": {
-            "strategy": strategy,
-            "winner": winner["model"],
-            "rationale": rationale,
-            "candidates": candidates,
-        },
-    }
-    return Response(
-        json.dumps(out),
-        status=200,
-        mimetype="application/json",
-        headers={"X-Swarm-Strategy": strategy, "X-Swarm-Winner": str(winner["model"])},
-    )
-
-
-@app.route("/swarm/pipeline", methods=["POST"])
-def swarm_pipeline():
-    """Sequential chain of models. Each step sees previous outputs via templates.
-
-    Body:
-      {
-        "messages": [...],          # original user/system messages
-        "steps": [
-          {"name": "plan",   "model": "role:reasoner",
-           "system": "Plan the steps to answer the user.",
-           "max_tokens": 512},
-          {"name": "code",   "model": "role:coder",
-           "system": "Implement the plan:\n{{plan}}",
-           "max_tokens": 1024},
-          {"name": "review", "model": "role:reasoner",
-           "system": "Critique and fix this implementation:\n{{code}}"}
-        ]
-      }
-
-    The final step's output is returned as an OpenAI chat.completion.
-    """
-    data = request.get_json(silent=True) or {}
-    steps = data.get("steps") or []
-    messages = data.get("messages") or []
-    if not isinstance(steps, list) or not steps or not isinstance(messages, list) or not messages:
-        return Response(json.dumps({"error": "steps and messages are required"}),
-                        status=400, mimetype="application/json")
-
-    available, err = get_lmstudio_model_ids()
-    if err:
-        return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
-
-    history = []
-    last_text = ""
-
-    for idx, step in enumerate(steps):
-        if not isinstance(step, dict):
-            continue
-        name = step.get("name") or f"step_{idx}"
-        ctx = {h["name"]: h["text"] for h in history}
-        ctx["previous"] = last_text
-
-        def _fmt(template):
-            if not isinstance(template, str):
-                return template
-            # Support both {{name}} (Mustache-ish) and {name} (str.format).
-            t = re.sub(r"\{\{(\w+)\}\}", r"{\1}", template)
-            try:
-                return t.format(**ctx)
-            except (KeyError, IndexError):
-                return template
-
-        sys_prompt = _fmt(step.get("system") or "")
-        user_template = step.get("user")
-
-        agent_messages = []
-        if sys_prompt:
-            agent_messages.append({"role": "system", "content": sys_prompt})
-        if user_template:
-            agent_messages.append({"role": "user", "content": _fmt(user_template)})
-        else:
-            agent_messages += [
-                m for m in messages
-                if isinstance(m, dict) and m.get("role") != "system"
-            ]
-
-        kwargs = {k: step[k] for k in ("max_tokens", "temperature", "top_p")
-                  if step.get(k) is not None}
-
-        model_id, resp, e, latency = _run_one_agent(
-            {"model": step.get("model")}, agent_messages, kwargs, available
-        )
-        if e or not resp:
-            return Response(
-                json.dumps({"error": f"step '{name}' failed: {e}", "history": history}),
-                status=502, mimetype="application/json",
-            )
-
-        text = _extract_text(resp)
-        history.append({
-            "name": name,
-            "model": model_id,
-            "text": text,
-            "latency_ms": latency,
-        })
-        last_text = text
-
-    final = history[-1] if history else {"text": "", "model": "?"}
-    return Response(
-        json.dumps({
-            "id": f"chatcmpl_{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": f"swarm/pipeline/{final['model']}",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": final.get("text", "")},
-                "finish_reason": "stop",
-            }],
-            "swarm": {"strategy": "pipeline", "history": history},
-        }),
-        status=200,
-        mimetype="application/json",
-        headers={
-            "X-Swarm-Strategy": "pipeline",
-            "X-Swarm-Steps": ",".join(h["name"] for h in history),
-        },
-    )
+register_lmstudio_routes(
+    app,
+    LmStudioRouteContext(
+        lm_studio_url=LM_STUDIO_URL,
+        lmstudio_client=_LMSTUDIO,
+        middle_layer_api_key=MIDDLE_LAYER_API_KEY,
+        model_roles=MODEL_ROLES,
+        model_roles_source=MODEL_ROLES_SOURCE,
+        prefer_loaded_models=bool(PREFER_LOADED_MODELS),
+        strict_loaded_models=bool(STRICT_LOADED_MODELS),
+        default_model=DEFAULT_MODEL,
+        on_model_miss=ON_MODEL_MISS,
+        anthropic_model=ANTHROPIC_MODEL,
+        anthropic_enabled=bool(ANTHROPIC_API_KEY),
+        enable_litellm_prefix_routing=bool(ENABLE_LITELLM_PREFIX_ROUTING),
+        litellm_for_anthropic=bool(USE_LITELLM_FOR_ANTHROPIC),
+        litellm_import_error=_litellm_import_error,
+        swarm_chat_enabled=bool(SWARM_CHAT_ENABLED),
+        max_parallel=MAX_PARALLEL_MODEL_CALLS,
+        per_model_inflight_cap=LM_STUDIO_PER_MODEL_INFLIGHT_CAP,
+        swarm_chat_default_models=SWARM_CHAT_DEFAULT_MODELS,
+        swarm_chat_default_strategy=SWARM_CHAT_DEFAULT_STRATEGY,
+        swarm_auto_tokens=_SWARM_AUTO_TOKENS,
+        swarm_chat_canonical=_SWARM_CHAT_CANONICAL,
+        swarm_chat_intents=_SWARM_CHAT_INTENTS,
+        check_api_key=_check_api_key,
+        apply_security_headers=_apply_security_headers,
+        get_model_ids=get_lmstudio_model_ids,
+        get_loaded_model_ids=get_loaded_lmstudio_model_ids,
+        litellm_available=_litellm_available,
+        should_route_to_anthropic=_should_route_to_anthropic,
+        call_anthropic_chat=_call_anthropic_chat,
+        call_litellm_chat=_call_litellm_chat,
+        swarm_chat_intent=_swarm_chat_intent,
+        run_swarm_chat_completion=_run_swarm_chat_completion,
+        swarm_body_to_sse_response=_swarm_body_to_sse_response,
+        resolve_model_id=resolve_model_id,
+        is_placeholder=_is_placeholder,
+        expand_swarm_models=_expand_swarm_models,
+        fanout=_fanout,
+        run_one_agent=_run_one_agent,
+        extract_text=_extract_text,
+        extract_user_intent=_extract_user_intent_text,
+        lmstudio_chat_completion=_lmstudio_chat_completion,
+        per_model_semaphore=_per_model_semaphore,
+    ),
+)
 
 
 def main() -> None:
