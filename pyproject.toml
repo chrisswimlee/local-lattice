@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # ---------------------------------------------------------------------------
 [project]
 name = "local-lattice"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local Lattice — MLX-native OpenAI-compatible gateway with capability routing, admission queue, and a hybrid local+cloud swarm."
 readme = "README.md"
 requires-python = ">=3.11"

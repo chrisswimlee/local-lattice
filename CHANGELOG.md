@@ -12,6 +12,19 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-11
+
+### Changed (LM Studio gateway: Pass 3 module extraction)
+
+- Extracted LM Studio HTTP probes and chat into
+  `middle_layer/lmstudio_client.py`.
+- Extracted Anthropic / LiteLLM cloud escalation into
+  `middle_layer/cloud_escalation.py`.
+- Extracted Flask route handlers into `middle_layer/lmstudio_routes.py`;
+  `middle_layer.py` is now a thin config + registration shell (~700 lines).
+- Added unit tests for the new modules (`tests/test_lmstudio_client_module.py`,
+  `tests/test_cloud_escalation_module.py`).
+
 ## [0.3.0] — 2026-06-11
 
 ### Changed (MLX gateway: cleanup — dead field + queue_controls + unload UI)
@@ -576,7 +589,8 @@ captured by the Pass 0 baseline (`docs/_internal/baseline/` on
   `127.0.0.1` should set `MIDDLE_LAYER_API_KEY` and put TLS in
   front of the gateway. See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/chrisswimlee/local-lattice/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/chrisswimlee/local-lattice/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.3.1
 [0.3.0]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.3.0
 [0.2.0]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.2.0
 [0.1.0]: https://github.com/chrisswimlee/local-lattice/releases
