@@ -167,56 +167,22 @@ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "").strip()
 # Configure via:
 #   MODEL_ROLES_JSON='{"coder":["qwen2.5-coder"],"fast":["3b"]}'
 #   MODEL_ROLES_FILE=/path/to/roles.json
-DEFAULT_MODEL_ROLES = {
-    "coder":    ["coder", "code"],
-    "reasoner": ["72b", "70b", "qwen2.5", "llama-3.3", "deepseek-r1"],
-    "fast":     ["3b", "7b", "phi", "mini", "small"],
-    "vision":   ["vl", "vision", "llava"],
-    "default":  [],
-}
+# Resolution logic lives in ``middle_layer/resolver.py`` (Pass 3); the
+# wrappers below keep the historical module-level surface stable.
+from middle_layer import resolver as _resolver  # noqa: E402
+from middle_layer.resolver import DEFAULT_MODEL_ROLES  # noqa: E402, F401
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _autodiscover_roles_file():
-    """Look for lmstudio_roles.json (preferred) or mlx_roles.json next to this
-    script and one directory up, so users running ``python middle_layer.py``
-    directly still get a tuned role registry without needing to set
-    ``MODEL_ROLES_FILE``. Returns the absolute path or None.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, "lmstudio_roles.json"),
-        os.path.join(os.path.dirname(here), "lmstudio_roles.json"),
-        os.path.join(here, "mlx_roles.json"),
-        os.path.join(os.path.dirname(here), "mlx_roles.json"),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
+    """Back-compat wrapper over ``middle_layer.resolver.autodiscover_roles_file``,
+    anchored at this script's directory."""
+    return _resolver.autodiscover_roles_file(_HERE)
 
 
 def _load_model_roles():
-    raw = os.environ.get("MODEL_ROLES_JSON")
-    if raw:
-        try:
-            return json.loads(raw), "MODEL_ROLES_JSON"
-        except Exception as e:
-            print(f"WARN: MODEL_ROLES_JSON is not valid JSON: {e}")
-    path = os.environ.get("MODEL_ROLES_FILE")
-    source = None
-    if not path:
-        path = _autodiscover_roles_file()
-        if path:
-            source = f"auto:{path}"
-    else:
-        source = f"env:{path}"
-    if path and os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f), source
-        except Exception as e:
-            print(f"WARN: cannot load MODEL_ROLES_FILE={path}: {e}")
-    return dict(DEFAULT_MODEL_ROLES), "default"
+    return _resolver.load_model_roles(_HERE)
 
 
 MODEL_ROLES, MODEL_ROLES_SOURCE = _load_model_roles()
@@ -479,58 +445,38 @@ def get_current_lmstudio_model():
     return ids[0], None
 
 
+def _resolver_policy() -> _resolver.ResolverPolicy:
+    """Snapshot the gateway's resolver knobs.
+
+    Built per-call (cheap dataclass) so tests and the dashboard can mutate
+    the module-level globals and the resolver sees the change immediately.
+    """
+    return _resolver.ResolverPolicy(
+        roles=MODEL_ROLES,
+        prefer_loaded=bool(PREFER_LOADED_MODELS),
+        strict_loaded=bool(STRICT_LOADED_MODELS),
+        default_model=DEFAULT_MODEL,
+        placeholder_ids=PLACEHOLDER_MODELS,
+    )
+
+
 def _is_placeholder(name) -> bool:
     """True when `name` is empty / a generic placeholder / a known cloud id."""
-    if name is None:
-        return True
-    if not isinstance(name, str):
-        return True
-    return name.strip().lower() in PLACEHOLDER_MODELS
+    return _resolver.is_placeholder(name, PLACEHOLDER_MODELS)
 
 
 def _match_one(needle: str, haystack):
     """First id in `haystack` matching `needle` (exact then substring, case-insensitive)."""
-    if not needle:
-        return None
-    n = needle.strip().lower()
-    for mid in haystack:
-        if mid.lower() == n:
-            return mid
-    for mid in haystack:
-        if n in mid.lower():
-            return mid
-    return None
+    return _resolver.match_one(needle, haystack)
 
 
 def _resolve_role(role: str, available, loaded=None):
     """First model id matching any preference for ``role``.
 
-    When ``PREFER_LOADED_MODELS`` is on (default) and ``loaded`` is non-empty,
-    every preference is first matched against the loaded subset; only if
-    nothing in the loaded subset matches do we fall back to the full
-    ``available`` set (which on LM Studio includes downloaded-but-not-loaded
-    ids that would JIT-load on first call). This stops swarm fanouts from
-    JIT-loading three different giant models in parallel and OOMing.
-
-    When ``STRICT_LOADED_MODELS`` is on AND ``loaded`` is non-empty, the
-    fall-through is suppressed entirely — a role miss returns ``None`` rather
-    than JIT-loading something the operator didn't explicitly stage.
+    Delegates to ``middle_layer.resolver.resolve_role`` with this gateway's
+    live policy (prefer-loaded / strict-loaded semantics documented there).
     """
-    prefs = MODEL_ROLES.get(role.lower(), [])
-    if isinstance(prefs, str):
-        prefs = [prefs]
-    if PREFER_LOADED_MODELS and loaded:
-        for p in prefs:
-            m = _match_one(p, loaded)
-            if m:
-                return m
-        if STRICT_LOADED_MODELS:
-            return None
-    for p in prefs:
-        m = _match_one(p, available)
-        if m:
-            return m
-    return None
+    return _resolver.resolve_role(role, available, loaded, policy=_resolver_policy())
 
 
 def resolve_model_id(requested, available=None, loaded=None):
@@ -565,72 +511,7 @@ def resolve_model_id(requested, available=None, loaded=None):
         loaded, _lerr = get_loaded_lmstudio_model_ids()
         # _lerr is non-fatal: on probe failure we just proceed against `available`.
 
-    # In strict mode, once LM Studio reports at least one loaded model we
-    # *only* resolve against that set. The installed-but-not-loaded set is
-    # what LM Studio would JIT-load behind the user's back, which is exactly
-    # the behavior STRICT_LOADED_MODELS is meant to disable.
-    strict = STRICT_LOADED_MODELS and bool(loaded)
-
-    if _is_placeholder(requested):
-        if DEFAULT_MODEL:
-            if PREFER_LOADED_MODELS and loaded:
-                m = _match_one(DEFAULT_MODEL, loaded)
-                if m:
-                    return m, None
-            if not strict:
-                m = _match_one(DEFAULT_MODEL, available)
-                if m:
-                    return m, None
-        # Try the "default" role next, then first loaded id, then first available.
-        m = _resolve_role("default", available, loaded=loaded)
-        if m:
-            return m, None
-        if PREFER_LOADED_MODELS and loaded:
-            return loaded[0], None
-        if strict:
-            # Defensive — bool(loaded) implies non-empty so we already
-            # returned above, but keep the guard so future edits can't sneak
-            # an installed-set fallthrough past us.
-            return None, "STRICT_LOADED_MODELS: no loaded LM Studio model available"
-        return available[0], None
-
-    candidates = [c.strip() for c in str(requested).split(",") if c.strip()]
-    # First pass: loaded-only (if we have a loaded view).
-    if PREFER_LOADED_MODELS and loaded:
-        for cand in candidates:
-            cand_lc = cand.lower()
-            if cand_lc.startswith("role:"):
-                m = _resolve_role(cand_lc.split(":", 1)[1], available, loaded=loaded)
-                if m:
-                    return m, None
-                continue
-            needle = cand.replace("*", "") if "*" in cand else cand
-            m = _match_one(needle, loaded)
-            if m:
-                return m, None
-        if strict:
-            return None, (
-                f"STRICT_LOADED_MODELS: '{requested}' did not match any "
-                f"loaded LM Studio model. Loaded: {loaded}"
-            )
-    # Second pass: full available set (allows JIT-load of installed ids).
-    for cand in candidates:
-        cand_lc = cand.lower()
-        if cand_lc.startswith("role:"):
-            m = _resolve_role(cand_lc.split(":", 1)[1], available, loaded=loaded)
-            if m:
-                return m, None
-            continue
-        if "*" in cand:
-            m = _match_one(cand.replace("*", ""), available)
-            if m:
-                return m, None
-            continue
-        m = _match_one(cand, available)
-        if m:
-            return m, None
-
-    return None, f"No loaded LM Studio model matched '{requested}'. Available: {available}"
+    return _resolver.resolve_model_id(requested, available, loaded, policy=_resolver_policy())
 
 
 def _looks_like_code(text_lower: str) -> bool:
