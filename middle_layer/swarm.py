@@ -84,7 +84,7 @@ if _SWARM_CHAT_DEFAULT_MODELS_ENV is None:
         "fanouts use the currently-loaded set instead of three role lookups "
         "that may JIT-load installed-but-not-loaded models. Set "
         f"SWARM_CHAT_DEFAULT_MODELS={_SWARM_CHAT_DEFAULT_MODELS_LEGACY!r} "
-        "to keep the legacy behavior; will be removed in 0.2.0.",
+        "to keep the legacy behavior; will be removed in 0.4.0.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -553,7 +553,7 @@ SWARM_CHAT_INTENTS: dict[str, tuple[str, bool]] = {
     "swarmcouncil":        ("council", False),
     "swarmvote":           ("council", False),
     "swarm/vote":          ("council", False),
-    "swarmintelligence":   ("council", True),   # openclaw runtime alias; will be removed in 0.2.0
+    "swarmintelligence":   ("council", True),   # openclaw runtime alias; will be removed in 0.4.0
     "swarm/fanout":        ("fanout", False),
     "swarm/pipeline":      ("pipeline", False),
 }
@@ -587,7 +587,7 @@ def swarm_chat_intent(requested_model) -> tuple[str, str] | tuple[None, None]:
         _swarm_alias_warned.add(name)
         warnings.warn(
             f"swarm meta-model {requested_model!r} is a deprecated alias for "
-            f"{SWARM_CHAT_CANONICAL!r}; will be removed in 0.2.0. "
+            f"{SWARM_CHAT_CANONICAL!r}; will be removed in 0.4.0. "
             f"Update your client to send model={SWARM_CHAT_CANONICAL!r}.",
             DeprecationWarning,
             stacklevel=2,

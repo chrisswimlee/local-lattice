@@ -59,7 +59,7 @@ The HTTP shape is just OpenAI. Any agent framework that can point at a custom
 OpenAI base URL works — see [`docs/integrations/`](./docs/integrations/) for
 LangGraph and OpenAI Agents SDK examples.
 
-> **Status (0.2.0): alpha.** The HTTP surface is stable in practice (every
+> **Status (0.3.0): alpha.** The HTTP surface is stable in practice (every
 > route is pinned by `docs/_internal/baseline/` regression captures) but the
 > Python API and internal module layout will change before 1.0. Pin the
 > version if you embed this. See [`docs/why-lattice.md`](./docs/why-lattice.md)
@@ -224,7 +224,7 @@ pip install -r requirements-mlx-gateway.txt   # == pip install -e .[mlx,anthropi
 ```
 
 Both files print a deprecation note in their comments. They will be
-removed in 0.3.0.
+removed in 0.4.0.
 
 ## Configuration
 
@@ -250,7 +250,7 @@ Quick reference of the most common knobs:
 | `DEFAULT_MODEL`             | _(empty)_   | Alias returned for `model: ""`/`auto`/`default`.        |
 | `MAX_CONCURRENT_MODELS`     | `2`         | LRU bound on resident MLX models.                       |
 | `MAX_PARALLEL_MODEL_CALLS`  | `2`         | Global concurrent-generation cap.                       |
-| `MLX_PER_MODEL_INFLIGHT_CAP`| `1`         | Per-alias generation cap (MLX gateway). `0` disables admission (legacy; emits `DeprecationWarning` when unset before 0.3.0). |
+| `MLX_PER_MODEL_INFLIGHT_CAP`| `1`         | Per-alias generation cap (MLX gateway). `0` disables admission (legacy; emits `DeprecationWarning` when unset before 0.4.0). |
 | `MLX_FORCE_GC_ON_EVICT`     | `0`         | When `1`, run `gc.collect()` after every MLX eviction in addition to the Metal-cache release. Tighter peak RSS on memory-tight Macs at the cost of small extra wall-clock latency per swap. |
 | `EXTRA_PLACEHOLDER_MODELS`  | _(unset → legacy OpenClaw set + `DeprecationWarning`)_ | Comma-separated extra "you pick" aliases; set to empty to exclude legacy ids. |
 | `PREFER_LOADED_MODELS`      | `strict`    | LM Studio gateway loaded-id policy. `strict` never JIT-loads installed-but-not-loaded ids; `1` falls back to the installed set on a miss; `0` ignores loaded vs installed. Unset emits a `DeprecationWarning` (legacy default was `1`). |
@@ -258,7 +258,7 @@ Quick reference of the most common knobs:
 | `SWARM_CHAT_AUTO_MAX`       | `3`         | Cap on how many loaded ids the `auto` sentinel contributes to a default-shaped swarm. Keeps fanout-vs-latency reasonable on boxes with many loaded models. Set to `0` to disable the cap. Dedicated `/swarm/fanout` HTTP endpoint ignores this. |
 | `SWARM_CHAT_DEFAULT_STRATEGY` | `best-of-n` | Default swarm winner-pick when the request omits `swarm.strategy`. `best-of-n` (judge picks from candidates), `first-success` (returns on first temporally successful agent, cancels pending peers), `longest`, `fanout`. |
 | `ANTHROPIC_API_KEY`         | _(unset)_   | Enables optional Claude escalation for long tasks.      |
-| `ANTHROPIC_AUTO_ROUTE`      | `1`         | Auto-escalate big tasks. Will default off in 0.3.0.     |
+| `ANTHROPIC_AUTO_ROUTE`      | `1`         | Auto-escalate big tasks. Will default off in 0.4.0.     |
 | `MLX_DASHBOARD_ENABLED`     | `1`         | Mount the in-process dashboard at `/dashboard/`.        |
 | `MLX_DASHBOARD_CAPTURE_PROMPTS` | `0`     | Keep prompts in the dashboard ring. Off by default.     |
 

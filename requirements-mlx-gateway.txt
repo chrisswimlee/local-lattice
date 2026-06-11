@@ -6,6 +6,6 @@
 # the `[mlx]` and `[anthropic]` extras, matching the previous
 # everything-but-LM-Studio footprint. See `pyproject.toml`.
 #
-# Will be removed in 0.3.0.
+# Will be removed in 0.4.0.
 
 --editable .[mlx,anthropic]

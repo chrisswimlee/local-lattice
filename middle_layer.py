@@ -108,7 +108,7 @@ if _PREFER_LOADED_ENV is None:
         f"{_PREFER_LOADED_LEGACY_DEFAULT!r}) so MiddleLayer never JIT-loads "
         "installed-but-not-loaded LM Studio models. Set "
         "PREFER_LOADED_MODELS=1 explicitly to keep the legacy prefer-loaded "
-        "behavior; will be removed in 0.2.0.",
+        "behavior; will be removed in 0.4.0.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -141,7 +141,7 @@ def _build_effective_placeholder_models() -> frozenset[str]:
             "EXTRA_PLACEHOLDER_MODELS is unset: OpenClaw-specific placeholder model "
             "IDs remain enabled for one minor release. Set EXTRA_PLACEHOLDER_MODELS "
             "to a comma-separated list (or empty string to disable) for explicit "
-            "control. Defaults change in 0.2.0.",
+            "control. Defaults change in 0.4.0.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -197,7 +197,7 @@ from middle_layer.swarm import (  # noqa: E402, F401
     # F401 is global to this block on purpose: every name here is a
     # back-compat re-export for pre-Pass-3 callers that historically
     # imported from middle_layer.py. Use middle_layer.swarm directly
-    # in new code; this surface stays stable until 0.2.0.
+    # in new code; this surface stays stable until 0.4.0.
     LM_STUDIO_PER_MODEL_INFLIGHT_CAP,
     MAX_PARALLEL_MODEL_CALLS,
     SWARM_CHAT_DEFAULT_JUDGE,

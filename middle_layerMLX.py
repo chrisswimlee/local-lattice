@@ -199,7 +199,7 @@ if _MAX_WORKERS_ENV is not None:
         "MAX_WORKERS is no longer honored: Flask's threaded=True does not "
         "take a worker cap, and this knob was only logged. Configure your "
         "upstream WSGI server (gunicorn --workers, uvicorn --workers, etc.) "
-        "instead. The env var is ignored and will be removed in 0.2.0.",
+        "instead. The env var is ignored and will be removed in 0.4.0.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -261,7 +261,7 @@ if _legacy_admission_cap_raw is not None:
     warnings.warn(
         "MLX_PER_MODEL_ADMISSION_CAP is deprecated; use "
         "MLX_PER_MODEL_INFLIGHT_CAP. Honored as a fallback for now; "
-        "will be removed in 0.2.0.",
+        "will be removed in 0.4.0.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -275,7 +275,7 @@ if _inflight_cap_env is None and _legacy_admission_cap_raw is None:
         "so direct invocations get the same back-pressure as the stable "
         "launcher. Set MLX_PER_MODEL_INFLIGHT_CAP=0 explicitly to keep "
         "the legacy 'no admission, rely only on gen_lock' behavior; "
-        "will be removed in 0.2.0.",
+        "will be removed in 0.4.0.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -310,14 +310,14 @@ _OPENCLAW_DEFAULT_PLACEHOLDERS = frozenset({
 
 
 def _build_effective_placeholder_models() -> frozenset[str]:
-    """Merge core + optional extras. OpenClaw-specific ids default-on until 0.2.0."""
+    """Merge core + optional extras. OpenClaw-specific ids default-on until 0.4.0."""
     raw = os.environ.get("EXTRA_PLACEHOLDER_MODELS")
     if raw is None:
         warnings.warn(
             "EXTRA_PLACEHOLDER_MODELS is unset: OpenClaw-specific placeholder model "
             "IDs remain enabled for one minor release. Set EXTRA_PLACEHOLDER_MODELS "
             "to a comma-separated list (or empty string to disable) for explicit "
-            "control. Defaults change in 0.2.0.",
+            "control. Defaults change in 0.4.0.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -3379,7 +3379,7 @@ def healthz():
             "generation_advisory_timeout_sec": GENERATION_TIMEOUT,
             "generation_timeout_sec": GENERATION_TIMEOUT,  # deprecated alias
             "generation_timeout_sec_deprecated": (
-                "renamed to generation_advisory_timeout_sec; will be removed in 0.2.0. "
+                "renamed to generation_advisory_timeout_sec; will be removed in 0.4.0. "
                 "Note: timeout is advisory (logging only); mlx_lm cannot be "
                 "safely cancelled mid-generation. Use per-request max_tokens "
                 "as the real budget control."

@@ -6,6 +6,6 @@
 # `[mlx]` extra, which is the new source of truth for the MLX runtime
 # dependency set. See `pyproject.toml` for the full list.
 #
-# Will be removed in 0.3.0.
+# Will be removed in 0.4.0.
 
 --editable .[mlx]
