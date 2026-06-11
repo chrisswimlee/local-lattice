@@ -44,10 +44,10 @@ import threading
 import time
 import uuid
 import warnings
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -225,6 +225,7 @@ def expand_swarm_models(
     but the gateway reports zero loaded models, the sentinel contributes
     nothing; the caller should error if the resulting list is empty.
     """
+    items: list[Any]
     if isinstance(spec, str):
         items = [spec]
     elif isinstance(spec, list):
@@ -699,13 +700,13 @@ class SwarmDeps:
         prefer_loaded_models: Honors the gateway's PREFER_LOADED_MODELS knob.
     """
 
-    chat_completion: Callable[..., tuple[Any, Optional[str]]]
-    resolve_model_id: Callable[..., tuple[Any, Optional[str]]]
-    get_available_models: Callable[[], tuple[list, Optional[str]]]
+    chat_completion: Callable[..., tuple[Any, str | None]]
+    resolve_model_id: Callable[..., tuple[Any, str | None]]
+    get_available_models: Callable[[], tuple[list, str | None]]
     extract_user_intent: Callable[[dict], str]
     anthropic_default_model: str
-    anthropic_chat: Optional[Callable[..., tuple[Any, Optional[str]]]] = None
-    get_loaded_models: Optional[Callable[[], tuple[list, Optional[str]]]] = None
+    anthropic_chat: Callable[..., tuple[Any, str | None]] | None = None
+    get_loaded_models: Callable[[], tuple[list, str | None]] | None = None
     prefer_loaded_models: bool = True
 
 
@@ -831,9 +832,9 @@ def fanout(
             i = futs[fut]
             try:
                 model_id, resp, e, latency = fut.result()
-            except Exception as e:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 model_id, resp, latency = "?", None, 0
-                e = str(e)
+                e = str(exc)
             text = extract_text(resp) if resp else ""
             api_ok = e is None and resp is not None
             error_kind = None
