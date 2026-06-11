@@ -5,16 +5,20 @@ and static UI. Does not expose chain-of-thought; only routing and I/O metadata.
 
 from __future__ import annotations
 
-import os
 import json
-import time
+import logging
+import os
 import re
 import threading
-import logging
-from collections import deque, defaultdict
+import time
+from collections import defaultdict, deque
 from typing import Any
 
-from flask import Blueprint, request, Response, send_from_directory, abort, redirect
+from flask import Blueprint, Response, abort, redirect, request, send_from_directory
+
+from middle_layer.security import alias_in_allowlist as _alias_in_allowlist
+from middle_layer.security import check_api_key as _check_api_key
+from middle_layer.security import is_well_formed_alias as _is_well_formed_alias
 
 log = logging.getLogger("mlx_dashboard")
 
@@ -41,12 +45,7 @@ def configure(**kwargs: Any) -> None:
 
 def _auth_ok() -> bool:
     key = os.environ.get("MIDDLE_LAYER_API_KEY")
-    if not key:
-        return True
-    x_api_key = request.headers.get("X-API-Key")
-    authz = request.headers.get("Authorization", "")
-    bearer = authz[len("Bearer ") :] if authz.startswith("Bearer ") else None
-    return x_api_key == key or bearer == key
+    return _check_api_key(request.headers, key)
 
 
 def _require_api_auth() -> Response | None:
@@ -202,6 +201,15 @@ class MetricsStore:
         available = mgr.get_available_aliases() if mgr else []
         loaded = mgr.get_loaded_aliases() if mgr else []
         mem = mgr.get_memory_stats() if mgr and hasattr(mgr, "get_memory_stats") else {}
+        # Surface MLXManager's sticky load-error map (added in the audit
+        # hardening pass). Operators see "alias X failed to load" in the
+        # dashboard snapshot without log grep.
+        load_errors: dict[str, Any] = {}
+        if mgr and hasattr(mgr, "get_recent_load_errors"):
+            try:
+                load_errors = mgr.get_recent_load_errors()
+            except Exception:
+                load_errors = {}
         budget_fn = _CTX.get("swarm_budget_fn")
         budget_example = float(budget_fn(3)) if callable(budget_fn) else None
         grab = bool(_CTX.get("grab_mode")()) if callable(_CTX.get("grab_mode")) else False
@@ -220,6 +228,8 @@ class MetricsStore:
             "models_available": available,
             "models_loaded": loaded,
             "memory": mem,
+            "recent_load_errors": load_errors,
+            "load_error_count": len(load_errors),
             "active_by_alias": active,
             "events": events[-MLX_DASHBOARD_MAX_EVENTS :],
             "preferences": self.get_preferences(),
@@ -332,6 +342,39 @@ def api_preferences():
     return Response(json.dumps({"ok": True, "preferences": prefs}), mimetype="application/json")
 
 
+@bp.route("/dashboard/api/admin/rescan", methods=["POST"])
+def api_admin_rescan():
+    """Re-walk MLX_MODEL_ROOT to pick up models added or removed on
+    disk since startup. Auth-required. Returns the {added, removed,
+    unchanged} diff so operators see what changed.
+    """
+    if not MLX_DASHBOARD_ENABLED:
+        return Response(json.dumps({"error": "dashboard disabled"}), status=404, mimetype="application/json")
+    denied = _require_api_auth()
+    if denied:
+        return denied
+    mgr = _CTX.get("mlx_manager")
+    if mgr is None or not hasattr(mgr, "rescan"):
+        return Response(
+            json.dumps({"error": "mlx_manager.rescan() not available"}),
+            status=503,
+            mimetype="application/json",
+        )
+    try:
+        diff = mgr.rescan()
+    except Exception as e:  # noqa: BLE001
+        return Response(
+            json.dumps({"error": f"rescan failed: {e}"}),
+            status=500,
+            mimetype="application/json",
+        )
+    return Response(
+        json.dumps({"ok": True, "diff": diff}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 @bp.route("/dashboard/api/models/load", methods=["POST"])
 def api_models_load():
     if not MLX_DASHBOARD_ENABLED:
@@ -339,16 +382,79 @@ def api_models_load():
     denied = _require_api_auth()
     if denied:
         return denied
+    # Audit finding: in grab mode the API only serves one model, but
+    # the dashboard load endpoint would happily push extra models into
+    # the LRU — wasting RAM and confusing operators. Block in grab mode.
+    grab_mode_fn = _CTX.get("grab_mode")
+    if callable(grab_mode_fn):
+        try:
+            if grab_mode_fn():
+                return Response(
+                    json.dumps({
+                        "error": (
+                            "model loading is disabled in grab mode "
+                            "(single-model). The chat API only serves "
+                            "the grabbed model; loading extra weights "
+                            "would just waste RAM."
+                        ),
+                    }),
+                    status=400,
+                    mimetype="application/json",
+                )
+        except Exception:
+            # Conservative: if the grab-mode check itself fails, fall
+            # through and try the load. Better to attempt the load and
+            # potentially confuse the operator than to silently 500 on
+            # the check.
+            pass
     mgr = _CTX.get("mlx_manager")
     if mgr is None:
         return Response(json.dumps({"error": "mlx_manager not configured"}), status=503, mimetype="application/json")
     data = request.get_json(silent=True) or {}
-    alias = (data.get("alias") or data.get("model") or "").strip()
+    raw_alias = data.get("alias") or data.get("model") or ""
+    alias = raw_alias.strip() if isinstance(raw_alias, str) else ""
     if not alias:
         return Response(json.dumps({"error": "alias required"}), status=400, mimetype="application/json")
+    if not _is_well_formed_alias(alias):
+        return Response(
+            json.dumps({"error": "alias contains disallowed characters"}),
+            status=400,
+            mimetype="application/json",
+        )
+    try:
+        available = list(mgr.get_available_aliases())
+    except Exception:
+        available = []
+    if not _alias_in_allowlist(alias, available):
+        return Response(
+            json.dumps({
+                "error": f"alias '{alias}' is not in the discovered model set",
+                "hint": "GET /dashboard/api/snapshot lists available aliases",
+            }),
+            status=400,
+            mimetype="application/json",
+        )
     h = mgr.load_model(alias)
     if h is None:
-        return Response(json.dumps({"error": f"could not load '{alias}'"}), status=400, mimetype="application/json")
+        # Audit finding: this used to return a generic "could not load"
+        # message even when the MLXManager had captured the underlying
+        # error in _last_load_errors (often the OOM-guided string).
+        # Surface that detail so the operator doesn't have to grep logs.
+        load_err = None
+        try:
+            getter = getattr(mgr, "get_last_load_error", None)
+            if callable(getter):
+                load_err = getter(alias)
+        except Exception:
+            load_err = None
+        return Response(
+            json.dumps({
+                "error": load_err or f"could not load '{alias}'",
+                "alias": alias,
+            }),
+            status=503 if load_err else 400,
+            mimetype="application/json",
+        )
     return Response(
         json.dumps({"ok": True, "alias": alias, "resident": mgr.get_loaded_aliases()}),
         mimetype="application/json",

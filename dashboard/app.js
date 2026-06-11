@@ -67,13 +67,44 @@
   function renderSnapshot(s) {
     const models = document.getElementById("models");
     const avail = (s.models_available || []).map((a) => `<span class="pill">${esc(a)}</span>`).join(" ");
-    const load = (s.models_loaded || []).map((a) => `<span class="pill">${esc(a)}</span>`).join(" ");
+    // Loaded models get an Unload button next to each pill so the
+    // operator can free Metal RAM from the dashboard UI instead of
+    // having to fire a DELETE /v1/models/<alias> by hand.
+    const load = (s.models_loaded || [])
+      .map(
+        (a) =>
+          `<span class="pill">${esc(a)} <button class="unload-btn" data-alias="${esc(a)}" title="Unload">×</button></span>`,
+      )
+      .join(" ");
+    const errCount = Number(s.load_error_count || 0);
+    const errSummary =
+      errCount > 0
+        ? `<p><strong>Recent load errors</strong> <span class="pill" style="background:#fee">${errCount}</span></p>`
+        : "";
     models.innerHTML =
       "<p><strong>Loaded</strong> " +
       (load || "<em>none</em>") +
       "</p><p><strong>On disk</strong> " +
       (avail || "<em>none</em>") +
-      "</p>";
+      "</p>" +
+      errSummary;
+    // Wire the Unload buttons after they're in the DOM.
+    Array.from(models.querySelectorAll(".unload-btn")).forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const alias = btn.getAttribute("data-alias");
+        if (!alias) return;
+        if (!confirm(`Unload '${alias}' from MLX?`)) return;
+        try {
+          await fetchJSON("/v1/models/" + encodeURIComponent(alias), {
+            method: "DELETE",
+            headers: { "X-API-Key": getKey() },
+          });
+        } catch (e) {
+          alert(e.message);
+        }
+        await refresh();
+      });
+    });
 
     const prefs = s.preferences || {};
     document.getElementById("defModel").value = prefs.default_model || "";
