@@ -2,7 +2,8 @@
 
 This file is written for coding agents and LLM-based tools that want to
 use a running Local Lattice gateway. It is self-contained: everything you
-need to integrate is below. Human-oriented docs: README.md,
+need to integrate is below. Human-oriented docs: README.md (see
+**Swarm in 60 seconds** for sequence diagrams and copy-paste examples),
 docs/capabilities.md, docs/integrations/.
 
 ## What you are talking to
@@ -54,6 +55,10 @@ Rules:
 - The response's top-level `model` field is always the concrete id that
   answered. The `X-Model-Resolution` / `X-Model-Routed-To` response
   headers explain non-obvious routing when present.
+- Timing headers on every response: `X-Lattice-Resolve-Ms`,
+  `X-Lattice-Queue-Ms`, `X-Lattice-Upstream-Ms`, `X-Lattice-Total-Ms`.
+  Disable structured timing logs with `LATTICE_LOG_TIMING=0`. See README
+  § Performance / routing overhead.
 
 ## Discover what is available (do this first)
 

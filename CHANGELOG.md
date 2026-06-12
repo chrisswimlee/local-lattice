@@ -12,6 +12,18 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+### Added
+
+- README **Swarm in 60 seconds** walkthrough: mermaid sequence diagrams for
+  `/swarm/vote` and `/swarm/pipeline`, copy-paste Python examples, and a
+  route cheat sheet. Cross-linked from `llms.txt`, `docs/capabilities.md`,
+  and `scripts/demo.sh`.
+- Fixed `docs/capabilities.md` pipeline docs to match the live `steps` +
+  `{{name}}` template API (was incorrectly documented as `stages`).
+- **`X-Lattice-*-Ms` timing headers** and structured `lattice.request` log
+  lines on LM Studio chat/swarm routes and MLX chat completions
+  (`middle_layer/timing.py`). Toggle logs with `LATTICE_LOG_TIMING=0`.
+
 ## [0.3.1] — 2026-06-11
 
 ### Changed (LM Studio gateway: Pass 3 module extraction)

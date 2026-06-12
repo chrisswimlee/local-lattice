@@ -79,3 +79,4 @@ print("  reply  ->", reply[:160])
 say "Done"
 note "Swap what is loaded in LM Studio and run this again — the same"
 note "role:* calls resolve to the new models with zero code changes."
+note "Diagrams + snippets: README § Swarm in 60 seconds"
