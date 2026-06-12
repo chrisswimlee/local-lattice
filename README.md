@@ -59,7 +59,7 @@ The HTTP shape is just OpenAI. Any agent framework that can point at a custom
 OpenAI base URL works — see [`docs/integrations/`](./docs/integrations/) for
 LangGraph and OpenAI Agents SDK examples.
 
-> **Status (0.3.1): alpha.** The HTTP surface is stable in practice (every
+> **Status (0.3.2): alpha.** The HTTP surface is stable in practice (every
 > route is pinned by `docs/_internal/baseline/` regression captures) but the
 > Python API and internal module layout will change before 1.0. Pin the
 > version if you embed this. See [`docs/why-lattice.md`](./docs/why-lattice.md)
