@@ -12,6 +12,8 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-12
+
 ### Added
 
 - ``local-lattice-init`` (alias ``middle-layer-init``): probes LM Studio or MLX
@@ -604,7 +606,8 @@ captured by the Pass 0 baseline (`docs/_internal/baseline/` on
   `127.0.0.1` should set `MIDDLE_LAYER_API_KEY` and put TLS in
   front of the gateway. See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/chrisswimlee/local-lattice/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/chrisswimlee/local-lattice/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.3.2
 [0.3.1]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.3.1
 [0.3.0]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.3.0
 [0.2.0]: https://github.com/chrisswimlee/local-lattice/releases/tag/v0.2.0
