@@ -98,6 +98,7 @@ from middle_layer.security import check_api_key as _check_api_key  # noqa: E402
 from middle_layer.security import enforce_safe_bind as _enforce_safe_bind  # noqa: E402
 from middle_layer.security import PublicBindWithoutAuthError as _PublicBindWithoutAuthError  # noqa: E402
 from middle_layer.security import resolve_max_request_bytes as _resolve_max_request_bytes  # noqa: E402
+from middle_layer.timing import RequestTimer, merge_mlx_legacy_timing  # noqa: E402
 
 # --- Shared swarm primitives (Pass 3) -----------------------------------------
 # The MLX gateway shares the error classifier, intent map, structured
@@ -3864,7 +3865,7 @@ def _handle_chat_request(data, request_headers=None):
         headers = {"X-Model-Routed-To": f"mlx/{alias}"}
         if fallback_from:
             headers["X-Model-Resolution"] = f"fallback (requested '{fallback_from}', not present)"
-        headers["X-MLX-Queue-Wait-Ms"] = str(queue_wait_ms)
+        merge_mlx_legacy_timing(headers, queue_ms=queue_wait_ms, upstream_ms=0)
         return Response(stream_with_context(stream_generator()),
                         mimetype="text/event-stream", headers=headers)
 
@@ -3963,8 +3964,6 @@ def _handle_chat_request(data, request_headers=None):
     }
     headers = {
         "X-Model-Routed-To": f"mlx/{alias}",
-        "X-MLX-Latency-Ms": str(elapsed),
-        "X-MLX-Queue-Wait-Ms": str(queue_wait_ms),
     }
     if forced_default_from is not None:
         headers["X-Model-Resolution"] = (
@@ -3972,6 +3971,21 @@ def _handle_chat_request(data, request_headers=None):
         )
     if fallback_from:
         headers["X-Model-Resolution"] = f"fallback (requested '{fallback_from}', not present)"
+    timing = RequestTimer.start()
+    timing.queue_ms = queue_wait_ms
+    timing.upstream_ms = elapsed
+    merge_mlx_legacy_timing(
+        headers,
+        queue_ms=queue_wait_ms,
+        upstream_ms=elapsed,
+        total_ms=timing.total_ms(),
+    )
+    timing.maybe_log(
+        method="POST",
+        path="/v1/chat/completions",
+        status=200,
+        routed_to=alias,
+    )
     return Response(json.dumps(body), status=200, mimetype="application/json", headers=headers)
 
 

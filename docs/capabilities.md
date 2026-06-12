@@ -130,6 +130,10 @@ override. Operators tune this file to teach Lattice about their fleet.
 
 The gateway exposes swarm functionality via two surfaces:
 
+> **Human walkthrough:** sequence diagrams and copy-paste Python for vote /
+> pipeline / fanout live in the README —
+> [Swarm in 60 seconds](../README.md#swarm-in-60-seconds).
+
 1. **Chat meta-models on `POST /v1/chat/completions`** — drop-in for any
    OpenAI-compatible client. Set `model:` to one of the names below and
    optionally pass a `swarm:` extension object alongside the standard
@@ -197,17 +201,36 @@ The judge sees all anonymized candidate answers and picks the winner.
 
 ### `POST /swarm/pipeline`
 
-Sequential. Output of stage N becomes input of stage N+1:
+Sequential. Each step's output is available to later steps via
+`{{step_name}}` or `{{previous}}` in that step's `system` / `user`
+templates:
 
 ```json
 {
-  "stages": [
-    { "model": "role:coder",     "prompt_prefix": "Draft code for:" },
-    { "model": "role:reasoner",  "prompt_prefix": "Review and fix:"  }
-  ],
-  "input": "..."
+  "messages": [{ "role": "user", "content": "Build a word-count CLI." }],
+  "steps": [
+    {
+      "name": "plan",
+      "model": "role:reasoner",
+      "system": "Outline the approach.",
+      "max_tokens": 512
+    },
+    {
+      "name": "code",
+      "model": "role:coder",
+      "system": "Implement:\n\n{{plan}}"
+    },
+    {
+      "name": "review",
+      "model": "role:reasoner",
+      "system": "Critique:\n\n{{code}}"
+    }
+  ]
 }
 ```
+
+See also the README walkthrough:
+[Swarm in 60 seconds](../README.md#swarm-in-60-seconds).
 
 ### `POST /swarm/debate`
 

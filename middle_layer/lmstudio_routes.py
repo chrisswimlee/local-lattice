@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,33 @@ import requests
 from flask import Flask, Response, request
 
 from middle_layer.lmstudio_client import LMStudioClient
+from middle_layer.timing import RequestTimer
+
+
+def _json_response(
+    body: dict | list,
+    http_status: int,
+    headers: dict[str, str] | None = None,
+    *,
+    timer: RequestTimer | None = None,
+    **log_fields: object,
+) -> Response:
+    hdrs = dict(headers or {})
+    if timer is not None:
+        hdrs.update(timer.header_dict())
+        timer.maybe_log(**log_fields)
+    return Response(json.dumps(body), status=http_status, mimetype="application/json", headers=hdrs)
+
+
+def _attach_timing(
+    response: Response,
+    timer: RequestTimer,
+    **log_fields: object,
+) -> Response:
+    for key, value in timer.header_dict().items():
+        response.headers[key] = value
+    timer.maybe_log(**log_fields)
+    return response
 
 
 def filtered_forward_headers() -> dict[str, str]:
@@ -176,6 +204,9 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
         if request.is_json:
             try:
                 json_data = json.loads(data)
+                timer: RequestTimer | None = None
+                if endpoint == "chat/completions":
+                    timer = RequestTimer.start()
 
                 if ctx.should_route_to_anthropic(endpoint, json_data):
                     if json_data.get("stream") is True:
@@ -273,9 +304,11 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                         )
 
                     wants_stream = json_data.get("stream") is True
-                    swarm_resp, swarm_err, swarm_err_details = ctx.run_swarm_chat_completion(
-                        requested, json_data, intent=swarm_intent
-                    )
+                    assert timer is not None
+                    with timer.measure("upstream_ms"):
+                        swarm_resp, swarm_err, swarm_err_details = ctx.run_swarm_chat_completion(
+                            requested, json_data, intent=swarm_intent
+                        )
                     if swarm_err or not swarm_resp:
                         body: dict = {"error": f"Swarm routing failed: {swarm_err}"}
                         if swarm_err_details:
@@ -300,7 +333,17 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                             headers=resp_headers or None,
                         )
                     if wants_stream:
-                        return ctx.swarm_body_to_sse_response(swarm_resp)
+                        stream_resp = ctx.swarm_body_to_sse_response(swarm_resp)
+                        if timer is not None:
+                            _attach_timing(
+                                stream_resp,
+                                timer,
+                                method="POST",
+                                path=f"/v1/{endpoint}",
+                                status=200,
+                                route_kind="swarm_chat",
+                            )
+                        return stream_resp
                     resp_headers = {
                         "X-Model-Routed-To": str(swarm_resp.get("model", "swarm/unknown")),
                         "X-Swarm-Intent": swarm_intent,
@@ -311,51 +354,67 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                         and swarm_canonical.lower() != requested.strip().lower()
                     ):
                         resp_headers["X-Swarm-Canonical-Name"] = swarm_canonical
-                    return Response(
-                        json.dumps(swarm_resp),
+                    return _json_response(
+                        swarm_resp,
+                        200,
+                        resp_headers,
+                        timer=timer,
+                        method="POST",
+                        path=f"/v1/{endpoint}",
                         status=200,
-                        mimetype="application/json",
-                        headers=resp_headers,
+                        route_kind="swarm_chat",
                     )
 
-                model_id, error = ctx.resolve_model_id(requested)
-                fallback_from = None
+                with timer.measure("resolve_ms") if timer else nullcontext():
+                    model_id, error = ctx.resolve_model_id(requested)
+                    fallback_from = None
 
-                if error or not model_id:
-                    if not ctx.is_placeholder(requested) and ctx.on_model_miss == "fallback":
-                        if ctx.strict_loaded_models:
-                            fb_ids, fb_err = ctx.get_loaded_model_ids()
-                        else:
-                            fb_ids, fb_err = ctx.get_model_ids()
-                        if not fb_err and fb_ids:
-                            model_id = fb_ids[0]
-                            fallback_from = requested
-                            error = None
                     if error or not model_id:
-                        return Response(
-                            json.dumps({"error": f"503 Service Unavailable - {error}"}),
-                            status=503,
-                            mimetype="application/json",
-                        )
+                        if not ctx.is_placeholder(requested) and ctx.on_model_miss == "fallback":
+                            if ctx.strict_loaded_models:
+                                fb_ids, fb_err = ctx.get_loaded_model_ids()
+                            else:
+                                fb_ids, fb_err = ctx.get_model_ids()
+                            if not fb_err and fb_ids:
+                                model_id = fb_ids[0]
+                                fallback_from = requested
+                                error = None
+                        if error or not model_id:
+                            return Response(
+                                json.dumps({"error": f"503 Service Unavailable - {error}"}),
+                                status=503,
+                                mimetype="application/json",
+                            )
 
                 json_data["model"] = model_id
 
-                resp = requests.request(
-                    method=request.method,
-                    url=f"{ctx.lm_studio_url}/v1/{endpoint}",
-                    headers=headers,
-                    data=json.dumps(json_data).encode("utf-8"),
-                    cookies=request.cookies,
-                    allow_redirects=False,
-                    stream=True,
-                    timeout=300,
-                )
+                with timer.measure("upstream_ms") if timer else nullcontext():
+                    resp = requests.request(
+                        method=request.method,
+                        url=f"{ctx.lm_studio_url}/v1/{endpoint}",
+                        headers=headers,
+                        data=json.dumps(json_data).encode("utf-8"),
+                        cookies=request.cookies,
+                        allow_redirects=False,
+                        stream=True,
+                        timeout=300,
+                    )
 
                 flask_resp = build_flask_response(resp)
                 flask_resp.headers["X-Model-Routed-To"] = f"local/{model_id}"
                 if fallback_from:
                     flask_resp.headers["X-Model-Resolution"] = (
                         f"fallback (requested '{fallback_from}', not loaded)"
+                    )
+                if timer is not None:
+                    _attach_timing(
+                        flask_resp,
+                        timer,
+                        method="POST",
+                        path=f"/v1/{endpoint}",
+                        status=resp.status_code,
+                        routed_to=model_id,
+                        model_spec=requested,
                     )
                 return flask_resp
 
@@ -408,6 +467,7 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
 
     @app.route("/swarm/fanout", methods=["POST"])
     def swarm_fanout():
+        timer = RequestTimer.start()
         data = request.get_json(silent=True) or {}
         models = data.get("models") or []
         messages = data.get("messages") or []
@@ -424,7 +484,8 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                 mimetype="application/json",
             )
 
-        models, exp_err = ctx.expand_swarm_models(models)
+        with timer.measure("resolve_ms"):
+            models, exp_err = ctx.expand_swarm_models(models)
         if exp_err:
             return Response(json.dumps({"error": exp_err}), status=503, mimetype="application/json")
         if not models:
@@ -443,26 +504,29 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
         common = {k: data.get(k) for k in ("max_tokens", "temperature", "top_p")}
         common = {k: v for k, v in common.items() if v is not None}
 
-        results, err = ctx.fanout(models, messages, common, max_parallel=data.get("max_parallel"))
+        with timer.measure("upstream_ms"):
+            results, err = ctx.fanout(models, messages, common, max_parallel=data.get("max_parallel"))
         if err:
             return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
 
-        return Response(
-            json.dumps(
-                {
-                    "id": f"swarm_{uuid.uuid4().hex}",
-                    "object": "swarm.fanout",
-                    "created": int(time.time()),
-                    "responses": results,
-                }
-            ),
+        return _json_response(
+            {
+                "id": f"swarm_{uuid.uuid4().hex}",
+                "object": "swarm.fanout",
+                "created": int(time.time()),
+                "responses": results,
+            },
+            200,
+            {"X-Swarm-Models": ",".join((r or {}).get("model", "?") for r in results)},
+            timer=timer,
+            method="POST",
+            path="/swarm/fanout",
             status=200,
-            mimetype="application/json",
-            headers={"X-Swarm-Models": ",".join((r or {}).get("model", "?") for r in results)},
         )
 
     @app.route("/swarm/vote", methods=["POST"])
     def swarm_vote():
+        timer = RequestTimer.start()
         data = request.get_json(silent=True) or {}
         models = data.get("models") or []
         messages = data.get("messages") or []
@@ -476,7 +540,8 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                 mimetype="application/json",
             )
 
-        models, exp_err = ctx.expand_swarm_models(models)
+        with timer.measure("resolve_ms"):
+            models, exp_err = ctx.expand_swarm_models(models)
         if exp_err:
             return Response(json.dumps({"error": exp_err}), status=503, mimetype="application/json")
         if not models:
@@ -496,106 +561,112 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
             k: data.get(k) for k in ("max_tokens", "temperature", "top_p") if data.get(k) is not None
         }
 
-        candidates, err = ctx.fanout(models, messages, common)
-        if err:
-            return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
+        with timer.measure("upstream_ms"):
+            candidates, err = ctx.fanout(models, messages, common)
+            if err:
+                return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
 
-        successes = [c for c in candidates if c["ok"] and c.get("text")]
-        if not successes:
-            errs = "; ".join(c.get("error") or "unknown" for c in candidates)
-            return Response(
-                json.dumps({"error": f"all agents failed: {errs}", "candidates": candidates}),
-                status=502,
-                mimetype="application/json",
-            )
+            successes = [c for c in candidates if c["ok"] and c.get("text")]
+            if not successes:
+                errs = "; ".join(c.get("error") or "unknown" for c in candidates)
+                return Response(
+                    json.dumps({"error": f"all agents failed: {errs}", "candidates": candidates}),
+                    status=502,
+                    mimetype="application/json",
+                )
 
-        rationale = ""
-        if strategy == "first-success":
-            winner = successes[0]
-            rationale = "first agent to return a non-empty response"
-        elif strategy == "longest":
-            winner = max(successes, key=lambda c: len(c.get("text", "")))
-            rationale = "longest non-empty response"
-        else:
-            labels = [chr(ord("A") + i) for i in range(len(successes))]
-            rendered = "\n\n".join(
-                f"[{labels[i]}] (model={successes[i]['model']})\n{successes[i]['text']}"
-                for i in range(len(successes))
-            )
-            original_user = ctx.extract_user_intent({"messages": messages})
-            judge_system = data.get("judge_system") or (
-                "You are a strict judge. Below are candidate responses to a user request "
-                "from different models, labeled [A], [B], etc. Pick the single best one. "
-                "Reply with ONLY the letter on its own line, then a one-sentence reason."
-            )
-            judge_messages = [
-                {"role": "system", "content": judge_system},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Original request:\n{original_user}\n\n"
-                        f"Candidate responses:\n{rendered}\n\n"
-                        "Pick the best one (A, B, ...) and explain briefly."
-                    ),
-                },
-            ]
-            judge_request = data.get("judge") or "role:reasoner"
-            avail, _ = ctx.get_model_ids()
-            judge_id, jerr = ctx.resolve_model_id(judge_request, avail)
-
-            if jerr or not judge_id:
+            rationale = ""
+            if strategy == "first-success":
+                winner = successes[0]
+                rationale = "first agent to return a non-empty response"
+            elif strategy == "longest":
                 winner = max(successes, key=lambda c: len(c.get("text", "")))
-                rationale = f"judge unavailable ({jerr or 'no model'}); picked longest"
+                rationale = "longest non-empty response"
             else:
-                with ctx.per_model_semaphore(judge_id):
-                    jresp, jerr = ctx.lmstudio_chat_completion(
-                        judge_id, judge_messages, max_tokens=200, temperature=0.0
-                    )
-                verdict = ctx.extract_text(jresp)
-                picked_idx = None
-                if verdict:
-                    for i, lab in enumerate(labels):
-                        if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
-                            picked_idx = i
-                            break
-                if picked_idx is None:
-                    winner = max(successes, key=lambda c: len(c.get("text", "")))
-                    rationale = (
-                        f"judge response unparseable; fell back to longest. "
-                        f"Verdict: {verdict[:140]}"
-                    )
-                else:
-                    winner = successes[picked_idx]
-                    rationale = verdict.strip()
+                labels = [chr(ord("A") + i) for i in range(len(successes))]
+                rendered = "\n\n".join(
+                    f"[{labels[i]}] (model={successes[i]['model']})\n{successes[i]['text']}"
+                    for i in range(len(successes))
+                )
+                original_user = ctx.extract_user_intent({"messages": messages})
+                judge_system = data.get("judge_system") or (
+                    "You are a strict judge. Below are candidate responses to a user request "
+                    "from different models, labeled [A], [B], etc. Pick the single best one. "
+                    "Reply with ONLY the letter on its own line, then a one-sentence reason."
+                )
+                judge_messages = [
+                    {"role": "system", "content": judge_system},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Original request:\n{original_user}\n\n"
+                            f"Candidate responses:\n{rendered}\n\n"
+                            "Pick the best one (A, B, ...) and explain briefly."
+                        ),
+                    },
+                ]
+                judge_request = data.get("judge") or "role:reasoner"
+                avail, _ = ctx.get_model_ids()
+                judge_id, jerr = ctx.resolve_model_id(judge_request, avail)
 
-        out = {
-            "id": f"chatcmpl_{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": f"swarm/{winner['model']}",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": winner["text"]},
-                    "finish_reason": "stop",
-                }
-            ],
-            "swarm": {
-                "strategy": strategy,
-                "winner": winner["model"],
-                "rationale": rationale,
-                "candidates": candidates,
-            },
-        }
-        return Response(
-            json.dumps(out),
+                if jerr or not judge_id:
+                    winner = max(successes, key=lambda c: len(c.get("text", "")))
+                    rationale = f"judge unavailable ({jerr or 'no model'}); picked longest"
+                else:
+                    with ctx.per_model_semaphore(judge_id):
+                        jresp, jerr = ctx.lmstudio_chat_completion(
+                            judge_id, judge_messages, max_tokens=200, temperature=0.0
+                        )
+                    verdict = ctx.extract_text(jresp)
+                    picked_idx = None
+                    if verdict:
+                        for i, lab in enumerate(labels):
+                            if re.search(rf"(?mi)^\s*{re.escape(lab)}\b", verdict):
+                                picked_idx = i
+                                break
+                    if picked_idx is None:
+                        winner = max(successes, key=lambda c: len(c.get("text", "")))
+                        rationale = (
+                            f"judge response unparseable; fell back to longest. "
+                            f"Verdict: {verdict[:140]}"
+                        )
+                    else:
+                        winner = successes[picked_idx]
+                        rationale = verdict.strip()
+
+            out = {
+                "id": f"chatcmpl_{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": f"swarm/{winner['model']}",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": winner["text"]},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "swarm": {
+                    "strategy": strategy,
+                    "winner": winner["model"],
+                    "rationale": rationale,
+                    "candidates": candidates,
+                },
+            }
+
+        return _json_response(
+            out,
+            200,
+            {"X-Swarm-Strategy": strategy, "X-Swarm-Winner": str(winner["model"])},
+            timer=timer,
+            method="POST",
+            path="/swarm/vote",
             status=200,
-            mimetype="application/json",
-            headers={"X-Swarm-Strategy": strategy, "X-Swarm-Winner": str(winner["model"])},
         )
 
     @app.route("/swarm/pipeline", methods=["POST"])
     def swarm_pipeline():
+        timer = RequestTimer.start()
         data = request.get_json(silent=True) or {}
         steps = data.get("steps") or []
         messages = data.get("messages") or []
@@ -606,86 +677,92 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                 mimetype="application/json",
             )
 
-        available, err = ctx.get_model_ids()
+        with timer.measure("resolve_ms"):
+            available, err = ctx.get_model_ids()
         if err:
             return Response(json.dumps({"error": err}), status=503, mimetype="application/json")
 
         history: list[dict] = []
         last_text = ""
 
-        for idx, step in enumerate(steps):
-            if not isinstance(step, dict):
-                continue
-            name = step.get("name") or f"step_{idx}"
-            step_ctx = {h["name"]: h["text"] for h in history}
-            step_ctx["previous"] = last_text
+        with timer.measure("upstream_ms"):
+            for idx, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    continue
+                name = step.get("name") or f"step_{idx}"
+                step_ctx = {h["name"]: h["text"] for h in history}
+                step_ctx["previous"] = last_text
 
-            def _fmt(template, _ctx=step_ctx):
-                if not isinstance(template, str):
-                    return template
-                t = re.sub(r"\{\{(\w+)\}\}", r"{\1}", template)
-                try:
-                    return t.format(**_ctx)
-                except (KeyError, IndexError):
-                    return template
+                def _fmt(template, _ctx=step_ctx):
+                    if not isinstance(template, str):
+                        return template
+                    t = re.sub(r"\{\{(\w+)\}\}", r"{\1}", template)
+                    try:
+                        return t.format(**_ctx)
+                    except (KeyError, IndexError):
+                        return template
 
-            sys_prompt = _fmt(step.get("system") or "")
-            user_template = step.get("user")
+                sys_prompt = _fmt(step.get("system") or "")
+                user_template = step.get("user")
 
-            agent_messages = []
-            if sys_prompt:
-                agent_messages.append({"role": "system", "content": sys_prompt})
-            if user_template:
-                agent_messages.append({"role": "user", "content": _fmt(user_template)})
-            else:
-                agent_messages += [
-                    m for m in messages if isinstance(m, dict) and m.get("role") != "system"
-                ]
+                agent_messages = []
+                if sys_prompt:
+                    agent_messages.append({"role": "system", "content": sys_prompt})
+                if user_template:
+                    agent_messages.append({"role": "user", "content": _fmt(user_template)})
+                else:
+                    agent_messages += [
+                        m for m in messages if isinstance(m, dict) and m.get("role") != "system"
+                    ]
 
-            kwargs = {
-                k: step[k] for k in ("max_tokens", "temperature", "top_p") if step.get(k) is not None
-            }
-
-            model_id, resp, e, latency = ctx.run_one_agent(
-                {"model": step.get("model")}, agent_messages, kwargs, available
-            )
-            if e or not resp:
-                return Response(
-                    json.dumps({"error": f"step '{name}' failed: {e}", "history": history}),
-                    status=502,
-                    mimetype="application/json",
-                )
-
-            text = ctx.extract_text(resp)
-            history.append(
-                {"name": name, "model": model_id, "text": text, "latency_ms": latency}
-            )
-            last_text = text
-
-        final = history[-1] if history else {"text": "", "model": "?"}
-        return Response(
-            json.dumps(
-                {
-                    "id": f"chatcmpl_{uuid.uuid4().hex}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": f"swarm/pipeline/{final['model']}",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": final.get("text", "")},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "swarm": {"strategy": "pipeline", "history": history},
+                kwargs = {
+                    k: step[k]
+                    for k in ("max_tokens", "temperature", "top_p")
+                    if step.get(k) is not None
                 }
-            ),
-            status=200,
-            mimetype="application/json",
-            headers={
+
+                model_id, resp, e, latency = ctx.run_one_agent(
+                    {"model": step.get("model")}, agent_messages, kwargs, available
+                )
+                if e or not resp:
+                    return Response(
+                        json.dumps({"error": f"step '{name}' failed: {e}", "history": history}),
+                        status=502,
+                        mimetype="application/json",
+                    )
+
+                text = ctx.extract_text(resp)
+                history.append(
+                    {"name": name, "model": model_id, "text": text, "latency_ms": latency}
+                )
+                last_text = text
+
+            final = history[-1] if history else {"text": "", "model": "?"}
+
+        return _json_response(
+            {
+                "id": f"chatcmpl_{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": f"swarm/pipeline/{final['model']}",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": final.get("text", "")},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "swarm": {"strategy": "pipeline", "history": history},
+            },
+            200,
+            {
                 "X-Swarm-Strategy": "pipeline",
                 "X-Swarm-Steps": ",".join(str(h["name"]) for h in history),
             },
+            timer=timer,
+            method="POST",
+            path="/swarm/pipeline",
+            status=200,
         )
 
 

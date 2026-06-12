@@ -113,6 +113,218 @@ It lists models, sends the same agent code at `role:fast` and
 `/swarm/vote` for a judged second opinion. Swap what's loaded and run it
 again — the calls don't change.
 
+See [Swarm in 60 seconds](#swarm-in-60-seconds) below for sequence diagrams
+and copy-paste examples.
+
+## Swarm in 60 seconds
+
+Swarm routes are the fastest way to get **multiple local models working
+together** without writing orchestration. You keep sending capabilities
+(`role:coder`, `"auto"`, …); Lattice resolves them against whatever is
+loaded and runs fanout, judge, or sequential steps for you.
+
+> **Tip:** Local reasoning models often need `max_tokens >= 2000` or they
+> spend the whole budget on hidden chain-of-thought and return empty
+> `content`. The snippets below default to 2000.
+
+### How `/swarm/vote` works
+
+One HTTP call → parallel fanout → judge picks a winner → you get a normal
+OpenAI-shaped `chat.completion` plus a `swarm` object with candidates.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Lattice
+    participant A as role:fast
+    participant B as role:coder
+    participant C as role:reasoner
+    participant Judge as judge (role:reasoner)
+
+    Client->>Lattice: POST /swarm/vote
+    par Fanout (parallel)
+        Lattice->>A: chat completion
+        Lattice->>B: chat completion
+        Lattice->>C: chat completion
+    end
+    A-->>Lattice: answer A
+    B-->>Lattice: answer B
+    C-->>Lattice: answer C
+    Lattice->>Judge: rank anonymized candidates
+    Judge-->>Lattice: winner + rationale
+    Lattice-->>Client: chat.completion + swarm.winner
+```
+
+Use `"models": "auto"` to fan out to every loaded chat-capable model
+(subject to the gateway's auto cap — see config table below).
+
+### How `/swarm/pipeline` works
+
+Sequential steps. Later steps reference earlier output via `{{plan}}`,
+`{{code}}`, or `{{previous}}` in each step's `system` prompt.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Lattice
+    participant Plan as plan (role:reasoner)
+    participant Code as code (role:coder)
+    participant Review as review (role:reasoner)
+
+    Client->>Lattice: POST /swarm/pipeline
+    Lattice->>Plan: step 1 — outline approach
+    Plan-->>Lattice: plan text
+    Lattice->>Code: step 2 — system includes {{plan}}
+    Code-->>Lattice: code text
+    Lattice->>Review: step 3 — system includes {{code}}
+    Review-->>Lattice: final answer
+    Lattice-->>Client: chat.completion (+ swarm.history)
+```
+
+### Copy-paste examples
+
+**1. Single capability route** — drop-in for any OpenAI client:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:5000/v1",  # or :5001 for MLX
+    api_key=os.environ.get("MIDDLE_LAYER_API_KEY", "local"),
+)
+resp = client.chat.completions.create(
+    model="role:coder",
+    messages=[{"role": "user", "content": "Reverse a string in Python."}],
+    max_tokens=2000,
+)
+print(resp.model)   # concrete model id that answered — log this
+print(resp.choices[0].message.content)
+```
+
+**2. Judged second opinion** — fanout + judge in one call:
+
+```python
+import os, requests
+
+BASE = "http://127.0.0.1:5000"
+headers = {
+    "Content-Type": "application/json",
+    "X-API-Key": os.environ.get("MIDDLE_LAYER_API_KEY", ""),
+}
+
+resp = requests.post(
+    f"{BASE}/swarm/vote",
+    headers=headers,
+    json={
+        "models": "auto",
+        "strategy": "best-of-n",
+        "judge": "role:reasoner",
+        "messages": [
+            {"role": "user", "content": "Name a coffee-shop WiFi network."}
+        ],
+        "max_tokens": 2000,
+    },
+    timeout=300,
+)
+data = resp.json()
+print("winner:", data.get("swarm", {}).get("winner"))
+print(data["choices"][0]["message"]["content"])
+```
+
+**3. Plan → code → review pipeline:**
+
+```python
+resp = requests.post(
+    f"{BASE}/swarm/pipeline",
+    headers=headers,
+    json={
+        "messages": [
+            {"role": "user", "content": "Build a CLI that counts words in a file."}
+        ],
+        "steps": [
+            {
+                "name": "plan",
+                "model": "role:reasoner",
+                "system": "Outline the approach in bullet points.",
+                "max_tokens": 512,
+            },
+            {
+                "name": "code",
+                "model": "role:coder",
+                "system": "Implement this plan:\n\n{{plan}}",
+            },
+            {
+                "name": "review",
+                "model": "role:reasoner",
+                "system": "Critique and suggest fixes:\n\n{{code}}",
+            },
+        ],
+        "max_tokens": 2000,
+    },
+    timeout=300,
+)
+```
+
+**4. OpenAI client shortcut** — same vote, no new endpoint:
+
+```python
+resp = client.chat.completions.create(
+    model="swarmCouncil",
+    messages=[{"role": "user", "content": "Pros and cons of SQLite for a side project?"}],
+    max_tokens=2000,
+    extra_body={
+        "swarm": {
+            "models": "auto",
+            "strategy": "best-of-n",
+            "judge": "role:reasoner",
+        },
+    },
+)
+```
+
+### Swarm route cheat sheet
+
+| Route | What it does | Returns |
+|-------|----------------|---------|
+| `POST /swarm/fanout` | Same prompt → N models in parallel | All answers (`object: swarm.fanout`) |
+| `POST /swarm/vote` | Fanout + judge | OpenAI `chat.completion` + `swarm.winner` |
+| `POST /swarm/pipeline` | Sequential steps with `{{name}}` templates | Final step as `chat.completion` |
+| `POST /swarm/debate` | Multi-round argument + judge synthesis | **MLX gateway only** (`:5001`) |
+| `POST /v1/chat/completions` with `model: swarmCouncil` | Vote via plain chat API | Supports `stream: true` |
+
+Full request/response contracts: [`docs/capabilities.md`](./docs/capabilities.md).
+Agent-oriented reference: [`llms.txt`](./llms.txt).
+
+Try it live: [`scripts/demo.sh`](./scripts/demo.sh) (steps 2–4 exercise
+capability routing and `/swarm/vote`).
+
+### Performance / routing overhead
+
+Every timed response includes standard headers:
+
+| Header | Meaning |
+|--------|---------|
+| `X-Lattice-Resolve-Ms` | Capability → model id (and swarm model expansion) |
+| `X-Lattice-Queue-Ms` | Admission / queue wait before inference starts |
+| `X-Lattice-Upstream-Ms` | LM Studio HTTP hop or MLX generation time |
+| `X-Lattice-Total-Ms` | End-to-end handler wall time |
+
+Legacy MLX headers `X-MLX-Latency-Ms` and `X-MLX-Queue-Wait-Ms` are still
+set on the MLX gateway for one minor.
+
+Structured logs (enabled by default, disable with `LATTICE_LOG_TIMING=0`):
+
+```text
+lattice.request resolve_ms=2 queue_ms=0 upstream_ms=840 total_ms=845 path=/v1/chat/completions status=200
+```
+
+Typical routing overhead on the **MLX direct path** is a few milliseconds.
+The **LM Studio proxy** adds roughly **3–10ms** per request for the
+localhost HTTP hop on top of resolve time. Streaming responses expose
+queue/resolve timing in headers at stream start; upstream time reflects
+generation and is also visible per chunk in the dashboard.
+
 ## Which gateway should I run?
 
 Local Lattice ships **two interchangeable gateways** that speak the same
