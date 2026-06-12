@@ -26,7 +26,7 @@ from middle_layer.timing import RequestTimer
 
 def _json_response(
     body: dict | list,
-    status: int,
+    http_status: int,
     headers: dict[str, str] | None = None,
     *,
     timer: RequestTimer | None = None,
@@ -36,7 +36,7 @@ def _json_response(
     if timer is not None:
         hdrs.update(timer.header_dict())
         timer.maybe_log(**log_fields)
-    return Response(json.dumps(body), status=status, mimetype="application/json", headers=hdrs)
+    return Response(json.dumps(body), status=http_status, mimetype="application/json", headers=hdrs)
 
 
 def _attach_timing(
@@ -304,6 +304,7 @@ def register_lmstudio_routes(app: Flask, ctx: LmStudioRouteContext) -> None:
                         )
 
                     wants_stream = json_data.get("stream") is True
+                    assert timer is not None
                     with timer.measure("upstream_ms"):
                         swarm_resp, swarm_err, swarm_err_details = ctx.run_swarm_chat_completion(
                             requested, json_data, intent=swarm_intent
