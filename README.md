@@ -74,6 +74,10 @@ cd local-lattice
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[mlx]"     # Apple Silicon only; use `[lmstudio]` elsewhere
 
+# Probe LM Studio or MLX on this machine and write role:* mappings
+local-lattice-init
+# or: local-lattice-init --backend lmstudio --dry-run
+
 # point at a folder with MLX weights (LM Studio's default is fine)
 export MLX_MODEL_ROOT="$HOME/.lmstudio/models"
 export MIDDLE_LAYER_API_KEY="$(uuidgen)"   # enable auth; deny-by-default

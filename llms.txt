@@ -150,3 +150,5 @@ This path supports `stream: true`; dedicated `/swarm/*` endpoints do not.
 5. Need a second opinion? One POST to `/swarm/vote` beats writing your
    own orchestration loop.
 6. Same code works on both gateways; only the port differs.
+7. First run: ``local-lattice-init`` writes ``lmstudio_roles.json`` or
+   ``mlx_roles.json`` for this machine (see README quickstart).
