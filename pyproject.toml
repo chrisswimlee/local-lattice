@@ -108,9 +108,11 @@ all = [
 # Canonical names (match PyPI distribution `local-lattice`).
 local-lattice-mlx = "middle_layer.cli:main_mlx"
 local-lattice-lmstudio = "middle_layer.cli:main_lmstudio"
+local-lattice-init = "middle_layer.cli:main_init"
 # Back-compat shims (same entry points; remove after one minor per AGENTS.md).
 middle-layer-mlx = "middle_layer.cli:main_mlx"
 middle-layer-lmstudio = "middle_layer.cli:main_lmstudio"
+middle-layer-init = "middle_layer.cli:main_init"
 
 # ---------------------------------------------------------------------------
 # Hatch build configuration

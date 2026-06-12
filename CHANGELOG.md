@@ -14,17 +14,19 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
 
 ### Added
 
-- README **Swarm in 60 seconds** walkthrough: mermaid sequence diagrams for
-  `/swarm/vote` and `/swarm/pipeline`, copy-paste Python examples, and a
-  route cheat sheet. Cross-linked from `llms.txt`, `docs/capabilities.md`,
-  and `scripts/demo.sh`.
-- Fixed `docs/capabilities.md` pipeline docs to match the live `steps` +
-  `{{name}}` template API (was incorrectly documented as `stages`).
-- **`X-Lattice-*-Ms` timing headers** and structured `lattice.request` log
-  lines on LM Studio chat/swarm routes and MLX chat completions
-  (`middle_layer/timing.py`). Toggle logs with `LATTICE_LOG_TIMING=0`.
+- ``local-lattice-init`` (alias ``middle-layer-init``): probes LM Studio or MLX
+  model directories, classifies chat models into ``role:*`` buckets, and writes
+  ``lmstudio_roles.json`` / ``mlx_roles.json``. Detects Ollama but does not
+  configure it yet.
 
 ## [0.3.1] — 2026-06-11
+
+### Added
+
+- README **Swarm in 60 seconds** walkthrough with mermaid diagrams, Python
+  snippets, and a route cheat sheet.
+- **`X-Lattice-*-Ms` timing headers** and structured ``lattice.request`` logs
+  (`middle_layer/timing.py`; disable with ``LATTICE_LOG_TIMING=0``).
 
 ### Changed (LM Studio gateway: Pass 3 module extraction)
 
@@ -36,6 +38,7 @@ will be reorganised without notice during the 0.x line. Pass 9 will add
   `middle_layer.py` is now a thin config + registration shell (~700 lines).
 - Added unit tests for the new modules (`tests/test_lmstudio_client_module.py`,
   `tests/test_cloud_escalation_module.py`).
+- Fixed `docs/capabilities.md` pipeline docs to match the live ``steps`` API.
 
 ## [0.3.0] — 2026-06-11
 

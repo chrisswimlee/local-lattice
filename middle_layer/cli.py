@@ -124,5 +124,12 @@ def main() -> None:
     main_mlx()
 
 
+def main_init() -> None:
+    """Entry point: ``local-lattice-init`` — probe backends and write roles JSON."""
+    from middle_layer.bootstrap import run_init
+
+    raise SystemExit(run_init())
+
+
 if __name__ == "__main__":  # pragma: no cover - manual invocation only
     main()
